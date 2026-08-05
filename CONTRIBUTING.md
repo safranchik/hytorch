@@ -48,3 +48,57 @@ session data.
 
 Use short commit subjects in the imperative form. Explain design decisions and
 test results in the pull request description.
+
+## Release process
+
+HyTorch publishes to PyPI through GitHub Trusted Publishing. A push to `main`
+runs CI but does not publish a package. Publishing starts only when a maintainer
+publishes a GitHub Release.
+
+For the first release, configure a pending publisher in the PyPI account:
+
+- Project name: `hytorch`
+- Owner: `safranchik`
+- Repository: `hytorch`
+- Workflow: `publish.yml`
+- Environment: `pypi`
+
+For each release:
+
+1. Update the version in `pyproject.toml` and `hytorch/__init__.py`.
+2. Add the dated release entry to `CHANGELOG.md`.
+3. Run the complete release checks:
+
+   ```sh
+   uv lock --check
+   uv run ruff check .
+   uv run ruff format --check .
+   uv run pytest -q
+   uv build
+   uvx --from twine twine check dist/*
+   ```
+
+4. Push the release commit to `main` and wait for all CI jobs to pass.
+5. Create and push an annotated version tag:
+
+   ```sh
+   git tag -a v0.1.0 -m "HyTorch 0.1.0"
+   git push origin v0.1.0
+   ```
+
+6. Publish the matching GitHub Release:
+
+   ```sh
+   gh release create v0.1.0 \
+     --title "HyTorch 0.1.0" \
+     --generate-notes
+   ```
+
+The `Publish` workflow builds the source distribution and wheel in an
+unprivileged job. A separate job obtains a short-lived PyPI credential through
+OpenID Connect and uploads the artifacts. The workflow stores no PyPI token.
+
+After publication, confirm that the version appears on PyPI and install it in a
+clean environment. PyPI release files are immutable. If an uploaded release is
+wrong, fix the problem and publish a new version. Do not replace an existing
+version or move its Git tag.
