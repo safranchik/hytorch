@@ -1,0 +1,19 @@
+.DS_Store
+*.log
+__pycache__/
+*.py[cod]
+
+# Local build output
+/bin/
+/dist/
+
+# Local development environments
+/.venv/
+.hytorch.env
+
+# Editor-local state
+/.vscode/*.local.json
+
+# Runtime model workspace stores
+/hytorch/workspaces/
+/example/terminal_bench/results/

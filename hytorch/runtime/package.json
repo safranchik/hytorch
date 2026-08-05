@@ -1,0 +1,9 @@
+{
+  "name": "hytorch-pi-runtime",
+  "private": true,
+  "type": "module",
+  "description": "Node runtime hytorch.PiHarness materializes and spawns per node, wrapping @earendil-works/pi-coding-agent (Pi) as hytorch's only harness.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0"
+  }
+}

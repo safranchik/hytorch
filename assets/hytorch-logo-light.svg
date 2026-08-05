@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 400" role="img" aria-labelledby="title desc">
+  <title id="title">HyTorch</title>
+  <desc id="desc">A compact recursive network beside the widely spaced HyTorch wordmark.</desc>
+
+  <defs>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <g id="micro-network">
+      <g fill="none" stroke="#8A98B8" stroke-opacity="0.7" stroke-width="1.5">
+        <path d="M -25 -14 L 0 -22 M -25 -14 L 0 0 M -25 -14 L 0 22" />
+        <path d="M -25 14 L 0 -22 M -25 14 L 0 0 M -25 14 L 0 22" />
+        <path d="M 0 -22 L 27 0 M 0 0 L 27 0 M 0 22 L 27 0" />
+      </g>
+      <g stroke="#F7F9FC" stroke-width="2">
+        <circle cx="-25" cy="-14" r="4.5" fill="#7B82FF" />
+        <circle cx="-25" cy="14" r="4.5" fill="#7B82FF" />
+        <circle cx="0" cy="-22" r="4.5" fill="#43D9E7" />
+        <circle cx="0" cy="0" r="4.5" fill="#43D9E7" />
+        <circle cx="0" cy="22" r="4.5" fill="#43D9E7" />
+        <circle cx="27" cy="0" r="5" fill="#0B0E14" />
+      </g>
+    </g>
+    <g id="recursive-node">
+      <circle r="54" fill="#F7F9FC" stroke="#7B82FF" stroke-width="3" />
+      <circle r="47" fill="none" stroke="#43D9E7" stroke-opacity="0.18" />
+      <use href="#micro-network" />
+    </g>
+  </defs>
+
+  <g id="mark" transform="translate(167 23) scale(0.68)">
+    <g fill="none" stroke="#65708B" stroke-opacity="0.55" stroke-width="4" stroke-linecap="round">
+      <path d="M 110 155 L 320 100 M 110 155 L 320 260 M 110 155 L 320 420" />
+      <path d="M 110 365 L 320 100 M 110 365 L 320 260 M 110 365 L 320 420" />
+      <path d="M 320 100 L 530 260 M 320 260 L 530 260 M 320 420 L 530 260" />
+    </g>
+    <path d="M 110 155 L 320 260 L 530 260" fill="none" stroke="#43D9E7" stroke-width="6" stroke-linecap="round" filter="url(#glow)" />
+    <use href="#recursive-node" transform="translate(110 155)" />
+    <use href="#recursive-node" transform="translate(110 365)" />
+    <use href="#recursive-node" transform="translate(320 100)" />
+    <use href="#recursive-node" transform="translate(320 260)" />
+    <use href="#recursive-node" transform="translate(320 420)" />
+    <use href="#recursive-node" transform="translate(530 260)" />
+  </g>
+
+  <text id="wordmark" x="633" y="235" fill="#0B0E14" font-family="Montserrat, sans-serif" font-size="128" font-weight="600" letter-spacing="12">HyTorch</text>
+</svg>
