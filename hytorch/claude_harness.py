@@ -199,7 +199,10 @@ def _latest_claude_session(home: Path) -> str | None:
     ]
     if not candidates:
         return None
-    return max(candidates, key=lambda path: path.stat().st_mtime_ns).stem
+    return max(
+        candidates,
+        key=lambda path: (path.stat().st_mtime_ns, path.as_posix()),
+    ).stem
 
 
 def _parse_claude_output(output: str) -> tuple[str, str, Usage]:

@@ -201,7 +201,7 @@ def test_claude_start_uses_isolated_native_home_and_machine_output(tmp_path):
     assert harness.usage() == Usage(11, 5, 6, 2)
 
 
-def test_claude_start_continues_latest_native_candidate_session(tmp_path):
+def test_claude_start_breaks_equal_session_mtimes_deterministically(tmp_path):
     root = _node(tmp_path)
     old_id = "00000000-0000-4000-8000-000000000001"
     new_id = "00000000-0000-4000-8000-000000000002"
@@ -213,6 +213,9 @@ def test_claude_start_continues_latest_native_candidate_session(tmp_path):
     new.write_text("new")
     old.touch()
     new.touch()
+    timestamp = max(old.stat().st_mtime_ns, new.stat().st_mtime_ns)
+    os.utime(old, ns=(timestamp, timestamp))
+    os.utime(new, ns=(timestamp, timestamp))
     calls = []
 
     def runner(args, **kwargs):
