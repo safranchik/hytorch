@@ -143,6 +143,39 @@ previous iteration. `backward()` resumes the agents and creates candidate
 workspace changes. `step()` promotes all completed changes as one new model
 generation.
 
+### Save and load model state
+
+Save the complete canonical model state as a self-contained Git directory:
+
+```python
+hytorch.save(model.state_dir(), "research-network")
+```
+
+Create the same model structure, then load the saved workspaces:
+
+```python
+restored = ResearchNetwork().to("pi")
+result = restored.load_state_dir(hytorch.load("research-network"))
+```
+
+This follows the PyTorch `state_dict()` pattern with a directory-native state:
+
+```python
+# PyTorch
+torch.save(model.state_dict(), "model.pth")
+model.load_state_dict(torch.load("model.pth", weights_only=True))
+
+# HyTorch
+hytorch.save(model.state_dir(), "model-state")
+model.load_state_dir(hytorch.load("model-state"))
+```
+
+A `StateDir` identifies one immutable model commit. The saved directory
+contains `MODEL.json`, every registered workspace, and the canonical model Git
+history. Loading is strict by default. Pass `strict=False` to permit missing or
+unexpected workspace keys with compatible shapes. The save destination must
+not already exist.
+
 ## PyTorch-shaped composition
 
 HyTorch follows PyTorch syntax and ownership where a direct agent equivalent
@@ -215,8 +248,8 @@ environments and review agent-created changes before production use.
 
 Version 0.1.0 includes Spaces, Parameters, dynamic Module graphs, dense Linear
 layers, directional backward feedback, atomic DFM optimizer generations, and
-the Dockerized Pi harness. It does not yet implement `state_dict()`. The
-`codex` and `claude-code` harnesses are reserved but unavailable.
+the Dockerized Pi harness. The `codex` and `claude-code` harnesses are reserved
+but unavailable.
 
 ## Resources
 

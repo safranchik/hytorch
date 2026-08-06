@@ -249,6 +249,37 @@ Feedback is transient text and does not use a third Git repository. Git gives
 Spaces and model generations stable identity, ancestry, diffs, audit history,
 and atomic promotion.
 
+## Model state directories
+
+HyTorch serializes model state as a directory because each Parameter element is
+already a complete directory. The public form follows PyTorch checkpoint
+syntax:
+
+```python
+hytorch.save(model.state_dir(), path)
+model.load_state_dir(hytorch.load(path))
+```
+
+`model.state_dir()` returns a `StateDir` fixed to the canonical model commit at
+the time of the call. It does not include an unpromoted DFM candidate.
+`hytorch.save()` creates a self-contained Git directory at that exact commit.
+The saved state contains `MODEL.json`, all registered workspace directories,
+and the canonical model history. It excludes feedback, active harness sessions,
+temporary node trees, and optimizer candidates.
+
+`hytorch.load()` validates the repository root, committed `MODEL.json`, format,
+and workspace paths. It returns a `StateDir`; it does not modify a model.
+`model.load_state_dir()` copies matching workspaces into an initialized model
+and records one canonical load commit. The default `strict=True` requires the
+saved and destination workspace keys to match exactly. `strict=False` permits
+missing and unexpected keys, but shape and module-type mismatches remain
+errors. The return value reports missing and unexpected keys in the same style
+as PyTorch's `load_state_dict()`.
+
+State capture and load require a clean canonical model worktree. Loading while
+an optimizer candidate is pending is an error. Validation must finish before
+HyTorch changes any destination workspace.
+
 ## Required invariants
 
 1. One output feature executes one agent.
@@ -264,3 +295,6 @@ and atomic promotion.
 11. Backward closes each resumed forward session.
 12. Only `optimizer.step()` promotes candidate workspace commits.
 13. `zero_feed()` never changes committed canonical workspace history.
+14. A StateDir identifies one committed, immutable model generation.
+15. Saved model state never includes transient feedback, sessions, or candidates.
+16. A failed state load leaves every destination workspace unchanged.

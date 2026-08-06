@@ -88,6 +88,7 @@ def test_parameter_tree_is_one_directory_per_agent():
     with open(os.path.join(store.root, "MODEL.json"), encoding="utf-8") as file:
         manifest = json.load(file)
     assert manifest["modules"]["layer"]["parameters"]["weight"]["shape"] == [3]
+    assert manifest["modules"]["layer"]["parameters"]["weight"]["input_features"] == 2
 
 
 def test_init_functions_can_reset_materialized_parameters():

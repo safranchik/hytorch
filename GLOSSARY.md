@@ -34,7 +34,9 @@
 | parameter delta | candidate workspace mutation | Proposed change made during backward |
 | updated parameter storage | promoted global Git commit | Canonical model generation after `step()` |
 | saved forward activations | statespace commit and harness session | Context resumed during backward |
-| `state_dict()` | model workspace Git repository | Serialization target; API not yet implemented |
+| `state_dict()` | `state_dir()` | Immutable handle to the canonical model-state revision |
+| `torch.save(model.state_dict(), path)` | `hytorch.save(model.state_dir(), path)` | Save complete parameter state and canonical history |
+| `load_state_dict(torch.load(path))` | `load_state_dir(hytorch.load(path))` | Validate and restore registered workspaces |
 
 The canonical training form is:
 
