@@ -93,6 +93,17 @@ class Repo:
         except GitError as exc:
             raise GitError(f"resolve git ref {ref!r}: {exc}") from exc
 
+    def read_file(self, commit: str, path: str) -> bytes:
+        """Read one file from a committed tree."""
+        result = subprocess.run(
+            ["git", "-C", self.root, "show", f"{commit}:{path}"],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise GitError(result.stderr.decode(errors="replace").strip())
+        return result.stdout
+
     def current_branch(self) -> str:
         branch = _run(self.root, ["symbolic-ref", "--quiet", "--short", "HEAD"])
         if not branch:

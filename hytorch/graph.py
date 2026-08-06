@@ -110,6 +110,23 @@ class Module(abc.ABC):
         self._ensure_parameter_store()
         return (parameter for _, parameter in self.named_parameters(recurse=recurse))
 
+    def state_dir(self):
+        """Return an immutable handle to the canonical model-state revision."""
+        from .state_dir import StateDir
+
+        store = self._ensure_parameter_store()
+        if not store.repo.is_clean():
+            raise RuntimeError(
+                "hytorch.mn.Module.state_dir: model state has uncommitted changes"
+            )
+        return StateDir(store.root, store.repo.resolve("HEAD"))
+
+    def load_state_dir(self, state_dir, strict: bool = True):
+        """Copy a StateDir into this Module and its descendants."""
+        from .state_dir import load_module_state
+
+        return load_module_state(self, state_dir, strict)
+
     def apply(self, fn):
         for child in self.children():
             child.apply(fn)
@@ -173,6 +190,7 @@ class Module(abc.ABC):
                         "parameters": {
                             parameter_name: {
                                 "shape": list(parameter.shape),
+                                "input_features": parameter.input_features,
                                 "workspaces": [
                                     view.relative_path for view in parameter.views()
                                 ],

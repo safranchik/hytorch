@@ -39,6 +39,10 @@ real text-agent equivalent exists.
 | `torch.optim` | `hytorch.optim` |
 | learning rate | mutation temperature `temp` |
 | applied parameter update | committed Git mutation |
+| `model.state_dict()` | `model.state_dir()` |
+| `torch.save(...)` | `hytorch.save(...)` |
+| `torch.load(...)` | `hytorch.load(...)` |
+| `model.load_state_dict(...)` | `model.load_state_dir(...)` |
 
 `Module.__setattr__` registers Parameters and child Modules. Registration owns
 state; calls in `forward()` dynamically define topology. `model.parameters()`
@@ -74,6 +78,12 @@ candidate model branch.
 `AGENTS.md` that contains seeded, randomly sampled, general phrases from
 `mn.init.DEFAULT_PRIORS`. It can later contain arbitrary code, tools, examples,
 and data.
+
+Model checkpoint syntax follows PyTorch with a directory-native representation:
+`hytorch.save(model.state_dir(), path)` and
+`model.load_state_dir(hytorch.load(path))`. A StateDir fixes one canonical model
+commit and preserves the complete model Git history. It excludes feedback,
+sessions, temporary node trees, and unpromoted optimizer candidates.
 
 Forward returns the complete committed statespace, never a special answer file.
 Do not inject Space contents into the agent prompt. Mount complete directory
