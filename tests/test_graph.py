@@ -12,6 +12,21 @@ def test_public_version_matches_release():
     assert hytorch.__version__ == "0.1.0"
 
 
+def test_all_builtin_native_harnesses_are_executable_adapters():
+    builtins = {
+        "pi": hytorch.harness.PiHarness,
+        "codex": hytorch.harness.CodexHarness,
+        "claude-code": hytorch.harness.ClaudeCodeHarness,
+        "opencode": hytorch.harness.OpenCodeHarness,
+        "hermes": hytorch.harness.HermesHarness,
+        "prime-agent": hytorch.harness.PrimeAgentHarness,
+    }
+
+    registered = hytorch.harness.registered()
+    for name, adapter in builtins.items():
+        assert isinstance(registered[name], adapter)
+
+
 class NullHarness(hytorch.harness.Harness):
     def start(self, directory, prompt, mtype, **kwargs):
         merge_agent_inputs(os.path.join(directory, "statespace"))
@@ -19,7 +34,7 @@ class NullHarness(hytorch.harness.Harness):
         return hytorch.harness.Result("done", session)
 
     def resume(self, session, directory, prompt, mtype, **kwargs):
-        return "done"
+        return hytorch.harness.Result("done", session)
 
     def close(self, session):
         pass
@@ -94,7 +109,7 @@ def test_linear_outputs_run_in_parallel(new_repo):
             return hytorch.harness.Result("done", session)
 
         def resume(self, session, directory, prompt, mtype, **kwargs):
-            return "done"
+            return hytorch.harness.Result("done", session)
 
         def close(self, session):
             pass
@@ -130,6 +145,27 @@ def test_arbitrary_forward_topology_composes(new_repo):
     assert len(output.feed_fn.parents) == 2
 
 
+def test_training_forks_one_episode_per_repeated_parameter_execution(new_repo):
+    class Recurrent(mn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = mn.Linear(1, 1)
+
+        def forward(self, value):
+            return self.layer(self.layer(value)[0])[0]
+
+    harness = hytorch.harness.register(NullHarness("recurrent-state"))
+    model = Recurrent().to(harness)
+
+    output = model(hytorch.space(new_repo.root, harness=harness))
+
+    second = output.feed_fn
+    first = second.parents[0]
+    assert second.parameters[0].relative_path == first.parameters[0].relative_path
+    assert second.workspace != first.workspace
+    assert second.session.id != first.session.id
+
+
 def test_module_to_supplies_harness_and_mtype(new_repo):
     class RecordingHarness(hytorch.harness.Harness):
         def __init__(self):
@@ -143,7 +179,7 @@ def test_module_to_supplies_harness_and_mtype(new_repo):
             return hytorch.harness.Result("done", session)
 
         def resume(self, session, directory, prompt, mtype, **kwargs):
-            return "done"
+            return hytorch.harness.Result("done", session)
 
         def close(self, session):
             pass

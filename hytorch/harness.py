@@ -36,7 +36,7 @@ class Usage:
 
 @dataclasses.dataclass(frozen=True)
 class Result:
-    """Result of starting a persisted harness session."""
+    """Text and opaque native session tip returned by one harness turn."""
 
     text: str
     session: Session
@@ -83,13 +83,13 @@ class Harness(abc.ABC):
         temperature: float | None = None,
         max_tokens: int | None = None,
         read_only: tuple[str, ...] = (),
-    ) -> str:
-        """Resume a saved session in ``directory`` and execute one prompt."""
+    ) -> Result:
+        """Resume a saved session and return its new opaque tip."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def close(self, session: Session) -> None:
-        """Release the persisted session and its harness-owned storage."""
+        """Release runtime resources without deleting persisted agent state."""
         raise NotImplementedError
 
 
@@ -118,7 +118,7 @@ class UnavailableHarness(Harness):
         temperature: float | None = None,
         max_tokens: int | None = None,
         read_only: tuple[str, ...] = (),
-    ) -> str:
+    ) -> Result:
         raise RuntimeError(f"hytorch harness {self.name!r} is built in but unavailable")
 
     def close(self, session: Session) -> None:
@@ -126,7 +126,7 @@ class UnavailableHarness(Harness):
 
 
 class PiHarness(Harness):
-    """The built-in Pi harness. Pi is the sole executable 0.1.0 runtime."""
+    """The built-in Pi harness."""
 
     name = "pi"
 
@@ -165,7 +165,66 @@ class PiHarness(Harness):
         temperature: float | None = None,
         max_tokens: int | None = None,
         read_only: tuple[str, ...] = (),
-    ) -> str:
+    ) -> Result:
+        return self._runtime.resume(
+            session,
+            directory,
+            prompt,
+            mtype,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            read_only=read_only,
+        )
+
+    def close(self, session: Session) -> None:
+        self._runtime.close(session)
+
+    def usage(self) -> Usage:
+        """Return aggregate token use for this harness instance."""
+        return self._runtime.usage()
+
+
+class PrimeAgentHarness(Harness):
+    """The built-in Prime Agent harness."""
+
+    name = "prime-agent"
+
+    def __init__(self, name: str | None = None, **kwargs) -> None:
+        from .prime_harness import PrimeRuntime
+
+        super().__init__(name)
+        self._runtime = PrimeRuntime(harness_name=self.name, **kwargs)
+
+    def start(
+        self,
+        directory: str,
+        prompt: str,
+        mtype: str | None,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        read_only: tuple[str, ...] = (),
+    ) -> Result:
+        return self._runtime.start(
+            directory,
+            prompt,
+            mtype,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            read_only=read_only,
+        )
+
+    def resume(
+        self,
+        session: Session,
+        directory: str,
+        prompt: str,
+        mtype: str | None,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        read_only: tuple[str, ...] = (),
+    ) -> Result:
         return self._runtime.resume(
             session,
             directory,
@@ -218,22 +277,38 @@ def name_of(harness: Harness | str) -> str:
     )
 
 
-# Stable built-ins. Only Pi has an executable implementation in 0.1.0.
+from .claude_harness import ClaudeCodeHarness  # noqa: E402
+from .codex_harness import CodexHarness  # noqa: E402
+from .hermes_harness import HermesHarness  # noqa: E402
+from .opencode_harness import OpenCodeHarness  # noqa: E402
+
+# Stable executable built-ins.
 pi = register(PiHarness())
-codex = register(UnavailableHarness("codex"))
-claude_code = register(UnavailableHarness("claude-code"))
+codex = register(CodexHarness())
+claude_code = register(ClaudeCodeHarness())
+opencode = register(OpenCodeHarness())
+hermes = register(HermesHarness())
+prime_agent = register(PrimeAgentHarness())
 
 __all__ = [
     "Harness",
+    "ClaudeCodeHarness",
+    "CodexHarness",
+    "HermesHarness",
+    "OpenCodeHarness",
     "PiHarness",
+    "PrimeAgentHarness",
     "Result",
     "Session",
     "Usage",
     "UnavailableHarness",
     "claude_code",
     "codex",
+    "hermes",
     "name_of",
     "pi",
+    "opencode",
+    "prime_agent",
     "register",
     "registered",
 ]

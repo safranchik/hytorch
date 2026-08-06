@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 
 from ._autofeed import Node
@@ -13,9 +14,10 @@ from .graph import Module
 from .parameter import (
     Parameter,
     ParameterStore,
-    create_workspace_checkout,
+    materialize_agent_state,
     set_tree_writable,
     tree_manifest,
+    validate_agent_state,
 )
 from .space import Space, SpaceBatch
 
@@ -157,6 +159,7 @@ class Linear(Module):
         branch = "hytorch-integration"
         root = tempfile.mkdtemp(prefix="hytorch-node-")
         statespace = os.path.join(root, "statespace")
+        parameter = os.path.join(root, "parameter")
         workspace = os.path.join(root, "workspace")
         commits = [value.commit for value in inputs]
         statespace_repo, integration_base = Repo.create_integration(
@@ -166,39 +169,46 @@ class Linear(Module):
 
         weight = self.weight[index]
         workspace_revision = weight.revision
-        workspace_repo = create_workspace_checkout(
-            weight.parameter._store.root,
+        materialize_agent_state(
+            weight.parameter._store,
             workspace_revision,
             weight.relative_path,
-            workspace,
+            parameter,
         )
-        workspace_before = tree_manifest(workspace)
-        workspace_head = workspace_repo.resolve("HEAD")
-        set_tree_writable(workspace, False)
+        validate_agent_state(parameter)
+        shutil.copytree(parameter, workspace, symlinks=True)
+        episode_identity = os.path.join(workspace, ".hytorch", "node-id")
+        if os.path.isfile(episode_identity):
+            os.remove(episode_identity)
+        parameter_before = tree_manifest(parameter)
+        set_tree_writable(parameter, False)
 
         prompt = self._build_prompt(
             task, index, workspace_revision, weight.relative_path
         )
-        result = harness.start(
-            root,
-            prompt,
-            mtype,
-            read_only=(workspace,),
-        )
         try:
-            unexpected = sorted(set(os.listdir(root)) - {"workspace", "statespace"})
+            result = harness.start(
+                root,
+                prompt,
+                mtype,
+                read_only=(parameter,),
+            )
+        except Exception:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        try:
+            validate_agent_state(workspace)
+            if tree_manifest(parameter) != parameter_before:
+                raise RuntimeError(
+                    f"hytorch.mn.Linear {self.id()}: forward modified the read-only Parameter"
+                )
+            unexpected = sorted(
+                set(os.listdir(root)) - {"parameter", "workspace", "statespace"}
+            )
             if unexpected:
                 raise RuntimeError(
                     f"hytorch.mn.Linear {self.id()}: forward changed paths outside the statespace: "
                     + ", ".join(unexpected)
-                )
-            if tree_manifest(workspace) != workspace_before:
-                raise RuntimeError(
-                    f"hytorch.mn.Linear {self.id()}: forward modified read-only workspace"
-                )
-            if workspace_repo.resolve("HEAD") != workspace_head:
-                raise RuntimeError(
-                    f"hytorch.mn.Linear {self.id()}: forward changed workspace Git state"
                 )
             if not statespace_repo.is_clean():
                 raise RuntimeError(
@@ -231,10 +241,14 @@ class Linear(Module):
             commit = statespace_repo.commit_allow_empty(statespace, message)
         except Exception:
             harness.close(result.session)
+            shutil.rmtree(root, ignore_errors=True)
             raise
 
         if inference:
             harness.close(result.session)
+            shutil.rmtree(workspace, ignore_errors=True)
+            set_tree_writable(parameter, True)
+            shutil.rmtree(parameter, ignore_errors=True)
             return Space(
                 statespace,
                 repo=statespace_repo,
@@ -249,7 +263,7 @@ class Linear(Module):
                 feed_fn=None,
             )
 
-        parameters = (weight,) if weight.parameter.requires_feed else ()
+        parameters = (weight,)
         parents = _deduplicate_nodes(
             [value.feed_fn for value in inputs if value.feed_fn is not None]
         )
@@ -266,6 +280,7 @@ class Linear(Module):
             commit=commit,
             root=root,
             workspace=workspace,
+            parameter=parameter,
             statespace=statespace,
             workspace_revision=workspace_revision,
         )
@@ -279,8 +294,8 @@ class Linear(Module):
             summary=result.text,
             harness=harness_name,
             mtype=mtype,
-            requires_feed=bool(parameters or parents),
-            feed_fn=node,
+            requires_feed=bool(weight.parameter.requires_feed or parents),
+            feed_fn=node if weight.parameter.requires_feed or parents else None,
         )
 
     def _build_prompt(
@@ -292,10 +307,14 @@ class Linear(Module):
     ) -> str:
         parts = [
             f"Run node {self.id()}[{index}] at workspace revision {workspace_revision}.\n\n",
-            "The node root contains two directories:\n",
+            "The node root contains three directories:\n",
             "- statespace/: writable self-contained Git state\n",
-            "- workspace/: read-only sparse model checkout with full model history\n\n",
-            f"Your learned workspace is workspace/{workspace_path}/.\n",
+            "- parameter/: read-only canonical native state\n",
+            "- workspace/: writable temporary episode fork\n\n",
+            f"HyTorch materialized parameter/ from private model path {workspace_path}. ",
+            "The directories have no model Git metadata. Use workspace/ for temporary "
+            "session state. Forward changes to workspace/ are never promoted. "
+            "Do not modify parameter/.\n",
             f"The {self.in_features} inputs are Git refs in statespace/:\n",
             *[
                 f"- refs/hytorch/inputs/{input_index}\n"
@@ -305,9 +324,9 @@ class Linear(Module):
             "merge order. Merge every input ref with --no-ff and "
             "--allow-unrelated-histories. Resolve and commit each merge before the "
             "next merge. You can make more statespace changes after merging. Commit "
-            "all changes before ending your turn. Leave the statespace repository "
+            "all statespace changes before ending your turn. Leave the statespace repository "
             "clean. Your final committed statespace HEAD is this node's output and is "
-            "passed to successor agents. Do not modify workspace/.\n",
+            "passed to successor agents. Do not run Git commands in workspace/.\n",
         ]
         if task:
             parts.extend(["\n# Task\n\n", task, "\n"])

@@ -12,26 +12,26 @@
 | `torch.nn` | `hytorch.mn` | Neural-network versus meta-network namespace |
 | neuron | agent | One output computation unit |
 | `nn.Module` | `mn.Module` | Registered owner with dynamic `forward()` topology |
-| `nn.Parameter` | `mn.Parameter` | Registered trainable workspace |
+| `nn.Parameter` | `mn.Parameter` | Registered persistent native agent state |
 | `model.parameters()` | `model.parameters()` | Iterator passed to an optimizer |
 | `nn.Linear(m, n)` | `mn.Linear(m, n)` | Dense mapping from `m` inputs to `n` agents |
-| `Linear.weight` | `Linear.weight` | Shape `(out_features,)`; one workspace per agent |
+| `Linear.weight` | `Linear.weight` | Shape `(out_features,)`; one native state per agent |
 | `Linear.bias` | workspace `AGENTS.md` initializer | Initial mutable direction for each output agent |
-| parameter value | workspace directory | Persistent instructions, code, tools, examples, and data |
+| parameter value | workspace directory | Opaque transcript, memory, instructions, skills, settings, databases, tools, and data |
 | `torch.nn.init` | `hytorch.mn.init` | In-place workspace initialization |
 | `torch.manual_seed` | `hytorch.manual_seed` | Seed workspace prior initialization |
 | autograd tape | retained execution graph | Dynamic forward provenance and saved sessions |
 | gradient direction | feedback string | Imperative direction for behavior change |
 | `.grad` | `.feed` | Accumulated downstream directions for one workspace |
 | loss tensor | `Loss` | Output Space plus terminal directional feedback |
-| `loss.backward()` | `loss.backward()` | Update candidates and propagate per-input feedback |
-| `optimizer.zero_grad()` | `optimizer.zero_feed()` | Clear feedback and discard an unpromoted candidate |
+| `loss.backward()` | `loss.backward()` | Accumulate owner feed and propagate per-input feedback |
+| `optimizer.zero_grad()` | `optimizer.zero_feed()` | Clear accumulated feed and an incomplete step candidate |
 | `torch.optim.Optimizer` | `hytorch.optim.Optimizer` | Own Parameters and update transaction state |
 | `torch.optim.SGD` | `hytorch.optim.DFM` | Gradient descent versus directional feedback mutation |
-| `optimizer.step()` | `optimizer.step()` | Promote the completed candidate model branch |
+| `optimizer.step()` | `optimizer.step()` | Reduce each Parameter once and atomically promote it |
 | learning rate `lr` | mutation temperature `temp` | Semantic update scale and sampling temperature |
 | optimizer budget | `max_tokens` | Backward agent output-token limit |
-| parameter delta | candidate workspace mutation | Proposed change made during backward |
+| parameter delta | owner mutation feed | Direction accumulated before one persistent owner update |
 | updated parameter storage | promoted global Git commit | Canonical model generation after `step()` |
 | saved forward activations | statespace commit and harness session | Context resumed during backward |
 | `state_dict()` | `state_dir()` | Immutable handle to the canonical model-state revision |

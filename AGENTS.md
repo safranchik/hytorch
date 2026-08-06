@@ -55,23 +55,24 @@ The `bias` initializes the mutable `AGENTS.md` in each output workspace.
 
 ## Node state
 
-Every executed output agent receives two sibling directory trees:
+Every executed output agent receives three sibling directory trees:
 
 ```text
 node/
   statespace/    # activation X becomes Y; writable during forward
-  workspace/     # persistent Parameter W; writable only during optimization
+  parameter/     # read-only canonical native agent state W
+  workspace/     # writable temporary episode fork
 ```
 
 Forward gives every output agent an independent, writable `statespace/.git`
 with one fetched local ref per input. The agent chooses the merge order,
 resolves conflicts, edits the statespace, and commits before it finishes. It
-uses a sparse,
-read-only `workspace/` checkout that contains the global model history.
-`loss.backward()` resumes the session with the permissions reversed. The agent
-commits workspace changes directly on the global candidate lineage and returns
-one directional feedback string per input. `DFM.step()` promotes the completed
-candidate model branch.
+uses a read-only `parameter/` and a writable `workspace/` episode fork with no
+model Git metadata. `loss.backward()` resumes the episode and returns one
+owner mutation proposal plus one directional feedback string per input.
+Backward accumulates proposals in `.feed` and discards the episode.
+`DFM.step()` resumes each persistent owner once with all accumulated feed. It
+updates a model candidate that HyTorch promotes atomically.
 
 `mn.Linear.reset_parameters()` delegates to `hytorch.mn.init`, just as
 `torch.nn.Linear` delegates to `torch.nn.init`. Each workspace starts with an
@@ -82,39 +83,44 @@ and data.
 Model checkpoint syntax follows PyTorch with a directory-native representation:
 `hytorch.save(model.state_dir(), path)` and
 `model.load_state_dir(hytorch.load(path))`. A StateDir fixes one canonical model
-commit and preserves the complete model Git history. It excludes feedback,
-sessions, temporary node trees, and unpromoted optimizer candidates.
+commit and preserves the complete model Git history. It includes durable
+native sessions and harness state. It excludes feedback, credentials, live
+runtime state, temporary node trees, and unpromoted optimizer candidates.
 
 Forward returns the complete committed statespace, never a special answer file.
 Do not inject Space contents into the agent prompt. Mount complete directory
-trees. `zero_feed()` clears accumulated feedback and discards an unpromoted
-candidate branch. It never deletes canonical Git history.
+trees. `zero_feed()` clears accumulated feedback and discards an incomplete
+step candidate. It never deletes canonical Git history.
 
 ## Git semantics
 
 Each Space owns its statespace repository and forward history. The private,
 global model workspace store records initialization and optimizer generations.
 Feedback is transient text.
-Workspace diffs are concrete mutations. DFM is evolutionary: it advances to
-every valid child mutation and does not roll back because one immediate result
-is worse.
+Agent-state diffs are concrete mutations. Agents never receive the private
+model repository and never create model commits. DFM is evolutionary: it
+advances to every valid child mutation and does not roll back because one
+immediate result is worse.
 
-Backward runs dependency-ready nodes with distinct workspace paths in
-parallel. Each node commits against one global candidate revision. HyTorch
-merges these commits into the global model history. Nodes that share a
-workspace path run in sequence.
+Backward runs dependency-ready episodes in parallel. Repeated execution of one
+Parameter creates separate episode forks. HyTorch does not merge these forks.
+`step()` gives all sorted feed records to the persistent owner. Each owner
+updates once. HyTorch commits all owner updates in one global candidate.
 
 ## Harnesses
 
-`hytorch.harness.Harness` is the execution base class. Built-ins are
-`hytorch.harness.pi`, `codex`, and `claude_code`; only Pi executes in v0. Pi
-uses OpenAI through the operator's Codex login or `OPENAI_API_KEY`, with
+`hytorch.harness.Harness` is the execution base class. Built-ins are `pi`,
+`codex`, `claude-code`, `opencode`, `hermes`, and `prime-agent`. Each harness
+stores its complete native profile and session inside the Parameter. A resumed
+turn returns a new opaque session tip because native compaction can rotate its
+identifier. `close()` releases runtime resources but does not delete state.
+Pi uses OpenAI through the operator's Codex login or `OPENAI_API_KEY`, with
 `gpt-5.6-terra` as the default model.
 
 One executed graph uses one harness. `model.to(harness)` moves the complete
 model before a new forward pass. Docker remains external deployment
-configuration. HyTorch uses the standard active Docker context and accepts
-`HYTORCH_PI_IMAGE` as an image override. Agent variables come from
+configuration. Container-capable harnesses use the standard active Docker
+context. Agent variables come from
 `.hytorch.env`, the global HyTorch secrets file, or `HYTORCH_ENV_FILE`. Never
 load the ordinary project `.env` automatically.
 
@@ -127,7 +133,7 @@ load the ordinary project `.env` automatically.
 - `hytorch/backward.py` — Loss and feed-Space propagation.
 - `hytorch/optim/` — Optimizer base and DFM.
 - `hytorch/space.py` — Space and lowercase `space` factory.
-- `hytorch/runtime/` — Dockerized Pi runtime.
+- `hytorch/runtime/` — packaged harness runtime assets.
 - `example/` — Terminal-Bench training and evaluation example.
 - `tests/` — offline unit tests plus an opt-in real Pi integration test.
 

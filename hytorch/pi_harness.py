@@ -25,7 +25,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from ._environment import agent_environment, docker_environment_file
+from ._environment import (
+    agent_environment,
+    command_environment,
+    docker_environment_file,
+)
 from .harness import Result, Session, Usage
 
 _DEFAULT_PROVIDER = "openai-codex"
@@ -84,20 +88,18 @@ class PiRuntime:
         max_tokens: int | None = None,
         read_only: tuple[str, ...] = (),
     ) -> Result:
-        session_dir = tempfile.mkdtemp(prefix="hytorch-pi-session-")
-        try:
-            text, session_id, session_file, _ = self._invoke(
-                directory,
-                prompt,
-                mtype,
-                session_dir=session_dir,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                read_only=read_only,
-            )
-        except Exception:
-            shutil.rmtree(session_dir, ignore_errors=True)
-            raise
+        _, session_dir = _pi_state_paths(directory)
+        prior_session = _single_session_file(session_dir)
+        text, session_id, session_file, _ = self._invoke(
+            directory,
+            prompt,
+            mtype,
+            session_dir=session_dir,
+            session_file=prior_session,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            read_only=read_only,
+        )
         return Result(
             text=text,
             session=Session(
@@ -115,7 +117,7 @@ class PiRuntime:
         temperature: float | None = None,
         max_tokens: int | None = None,
         read_only: tuple[str, ...] = (),
-    ) -> str:
+    ) -> Result:
         if session.harness != self.harness_name:
             raise ValueError(
                 f"hytorch Pi harness cannot resume a {session.harness!r} session"
@@ -124,7 +126,7 @@ class PiRuntime:
             raise RuntimeError(
                 f"hytorch Pi harness: saved session {session.id!r} is unavailable"
             )
-        text, resumed_id, _, _ = self._invoke(
+        text, resumed_id, resumed_file, _ = self._invoke(
             directory,
             prompt,
             mtype,
@@ -138,14 +140,20 @@ class PiRuntime:
             raise RuntimeError(
                 f"hytorch Pi harness: resumed session {resumed_id!r}, expected {session.id!r}"
             )
-        return text
+        return Result(
+            text=text,
+            session=Session(
+                harness=self.harness_name, id=resumed_id, storage=resumed_file
+            ),
+        )
 
     def close(self, session: Session) -> None:
         if session.harness != self.harness_name:
             raise ValueError(
                 f"hytorch Pi harness cannot close a {session.harness!r} session"
             )
-        shutil.rmtree(os.path.dirname(session.storage), ignore_errors=True)
+        # Session storage is part of the supplied workspace. Closing a runtime
+        # must not delete agent state.
 
     def _invoke(
         self,
@@ -174,7 +182,11 @@ class PiRuntime:
         try:
             environment = agent_environment()
             provider = self._provider_for(environment)
-            with docker_environment_file(values=environment) as environment_path:
+            agent_state_dir, _ = _pi_state_paths(directory)
+            with (
+                _staged_agent_directory(agent_state_dir) as agent_dir,
+                docker_environment_file(values=environment) as environment_path,
+            ):
                 if self.docker:
                     runtime_name = self._docker_image or "hytorch-pi Docker image"
                     if self._uses_remote_docker():
@@ -189,28 +201,28 @@ class PiRuntime:
                             read_only=read_only,
                             environment_path=environment_path,
                             provider=provider,
+                            agent_dir=agent_dir,
                         )
                     else:
-                        with _staged_agent_directory() as agent_dir:
-                            args = self._docker_run_args(
-                                directory,
-                                prompt_path,
-                                resolved_model,
-                                session_dir=session_dir,
-                                session_file=session_file,
-                                temperature=temperature,
-                                max_tokens=max_tokens,
-                                read_only=read_only,
-                                environment_path=environment_path,
-                                provider=provider,
-                                agent_dir=agent_dir,
-                            )
-                            result = subprocess.run(
-                                args,
-                                capture_output=True,
-                                text=True,
-                                check=False,
-                            )
+                        args = self._docker_run_args(
+                            directory,
+                            prompt_path,
+                            resolved_model,
+                            session_dir=session_dir,
+                            session_file=session_file,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            read_only=read_only,
+                            environment_path=environment_path,
+                            provider=provider,
+                            agent_dir=agent_dir,
+                        )
+                        result = subprocess.run(
+                            args,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
                 else:
                     script_path = os.path.join(runtime_dir, "hytorch-pi.mjs")
                     args = self._host_run_args(
@@ -225,14 +237,18 @@ class PiRuntime:
                         provider=provider,
                     )
                     runtime_name = script_path
-                    command_environment = dict(os.environ)
-                    command_environment.update(environment)
+                    process_environment = command_environment(values=environment)
+                    process_environment["PI_CODING_AGENT_DIR"] = agent_dir
+                    process_environment["HOME"] = os.path.join(
+                        os.path.dirname(agent_state_dir), "home"
+                    )
+                    os.makedirs(process_environment["HOME"], exist_ok=True)
                     result = subprocess.run(
                         args,
                         capture_output=True,
                         text=True,
                         check=False,
-                        env=command_environment,
+                        env=process_environment,
                     )
                 if result.returncode != 0:
                     raise RuntimeError(
@@ -431,6 +447,7 @@ class PiRuntime:
         read_only: tuple[str, ...],
         environment_path: str | None,
         provider: str,
+        agent_dir: str,
     ) -> subprocess.CompletedProcess[str]:
         if self._docker_image is None:
             raise RuntimeError("hytorch Pi harness: Docker image was not initialized")
@@ -444,6 +461,7 @@ class PiRuntime:
             "statespace": prefix + "-state",
             "workspace": prefix + "-workspace",
             "session": prefix + "-session",
+            "agent": prefix + "-agent",
             "prompt": prefix + "-prompt",
         }
         created: list[str] = []
@@ -470,6 +488,7 @@ class PiRuntime:
                 os.path.join(directory, "workspace"), volumes["workspace"]
             )
             self._upload_volume(session_dir, volumes["session"])
+            self._upload_volume(agent_dir, volumes["agent"])
             self._upload_volume(prompt_dir, volumes["prompt"])
 
             root = os.path.realpath(directory)
@@ -491,6 +510,8 @@ class PiRuntime:
                 [
                     "--mount",
                     f"type=volume,src={volumes['session']},dst=/run/hytorch/session",
+                    "--mount",
+                    f"type=volume,src={volumes['agent']},dst=/root/.pi/agent",
                     "--mount",
                     f"type=volume,src={volumes['prompt']},dst=/run/hytorch/prompt,readonly",
                 ]
@@ -531,6 +552,7 @@ class PiRuntime:
                     if source not in read_only_paths:
                         self._download_volume(volumes[name], source)
                 self._download_volume(volumes["session"], session_dir)
+                self._download_volume(volumes["agent"], agent_dir)
             return result
         finally:
             shutil.rmtree(prompt_dir, ignore_errors=True)
@@ -718,20 +740,83 @@ class PiRuntime:
 
 
 @contextmanager
-def _staged_agent_directory() -> Iterator[str]:
-    """Give one container an isolated Pi config and preserve newer OAuth data."""
-    source = os.path.realpath(os.path.expanduser("~/.pi/agent"))
-    os.makedirs(source, exist_ok=True)
+def _staged_agent_directory(persistent: str) -> Iterator[str]:
+    """Overlay operator auth on one node-owned Pi profile.
+
+    The staged profile is visible to Pi. Only its non-secret contents return to
+    the supplied workspace. Refreshed OAuth credentials return to the operator.
+    """
+    persistent = os.path.realpath(persistent)
+    os.makedirs(persistent, exist_ok=True)
+    leaked_auth = os.path.join(persistent, "auth.json")
+    if os.path.lexists(leaked_auth):
+        os.remove(leaked_auth)
+    operator = os.path.realpath(
+        os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent"))
+    )
+    os.makedirs(operator, exist_ok=True)
     parent = tempfile.mkdtemp(prefix="hytorch-pi-agent-")
     staged = os.path.join(parent, "agent")
+    shutil.copytree(persistent, staged)
+    operator_auth = os.path.join(operator, "auth.json")
     with _auth_lock:
-        shutil.copytree(source, staged)
+        if os.path.isfile(operator_auth):
+            shutil.copy2(operator_auth, os.path.join(staged, "auth.json"))
     try:
         yield staged
     finally:
-        with _auth_lock:
-            _promote_newer_auth(os.path.join(staged, "auth.json"), source)
-        shutil.rmtree(parent, ignore_errors=True)
+        try:
+            with _auth_lock:
+                _promote_newer_auth(os.path.join(staged, "auth.json"), operator)
+            _replace_agent_profile(staged, persistent)
+        finally:
+            shutil.rmtree(parent, ignore_errors=True)
+
+
+def _pi_state_paths(directory: str) -> tuple[str, str]:
+    workspace = os.path.realpath(os.path.join(directory, "workspace"))
+    root = os.path.realpath(directory)
+    if os.path.commonpath((root, workspace)) != root or not os.path.isdir(workspace):
+        raise RuntimeError("hytorch Pi harness: node workspace is unavailable")
+    state = os.path.join(workspace, ".pi")
+    agent = os.path.join(state, "agent")
+    sessions = os.path.join(state, "sessions")
+    os.makedirs(agent, exist_ok=True)
+    os.makedirs(sessions, exist_ok=True)
+    return agent, sessions
+
+
+def _single_session_file(session_dir: str) -> str | None:
+    sessions = sorted(
+        os.path.join(session_dir, name)
+        for name in os.listdir(session_dir)
+        if name.endswith(".jsonl") and os.path.isfile(os.path.join(session_dir, name))
+    )
+    if len(sessions) > 1:
+        raise RuntimeError(
+            "hytorch Pi harness: node state contains more than one root session"
+        )
+    return sessions[0] if sessions else None
+
+
+def _replace_agent_profile(candidate: str, destination: str) -> None:
+    """Replace a candidate profile without copying its auth file."""
+    parent = os.path.dirname(destination)
+    staged = tempfile.mkdtemp(prefix=".hytorch-pi-profile-", dir=parent)
+    try:
+        for name in os.listdir(candidate):
+            if name == "auth.json":
+                continue
+            source = os.path.join(candidate, name)
+            target = os.path.join(staged, name)
+            if os.path.isdir(source) and not os.path.islink(source):
+                shutil.copytree(source, target, symlinks=True)
+            else:
+                shutil.copy2(source, target, follow_symlinks=False)
+        shutil.rmtree(destination)
+        os.replace(staged, destination)
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
 
 
 def _promote_newer_auth(candidate: str, destination_dir: str) -> None:

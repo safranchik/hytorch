@@ -22,13 +22,15 @@ class Loss:
             raise ValueError("hytorch.Loss feedback must be non-empty text")
         self.feedback = self.feedback.strip()
 
-    def backward(self) -> None:
-        """Update candidate workspaces and propagate feedback through the graph."""
+    def backward(self, retain_graph: bool | None = None) -> None:
+        """Accumulate directional feedback through the executed graph."""
+        if retain_graph is not None and not isinstance(retain_graph, bool):
+            raise TypeError("hytorch.Loss.backward retain_graph must be a bool or None")
         if self.output.feed_fn is None:
             raise RuntimeError("hytorch.Loss output has no executed graph to traverse")
         nodes = ancestors([self.output.feed_fn])
         for node in nodes:
-            if node.released or node.consumed:
+            if node.consumed:
                 raise RuntimeError(
                     "Trying to backward through the graph a second time. "
                     "Run a new forward pass first."
@@ -48,7 +50,7 @@ class Loss:
                 "hytorch.Loss.backward requires one optimizer for the executed graph"
             )
         optimizer = next(iter(optimizers))
-        optimizer._backward(self.output, self.feedback)
+        optimizer._backward(self.output, self.feedback, retain_graph=bool(retain_graph))
 
 
 @dataclasses.dataclass(frozen=True)

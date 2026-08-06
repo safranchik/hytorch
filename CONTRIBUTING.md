@@ -43,8 +43,9 @@ Pi uses the operator's Codex login by default. To use an OpenAI API key, export
 
 Keep each pull request focused. Add tests for behavior changes. Update
 `README.md`, `SPEC.md`, and `GLOSSARY.md` when a public concept changes. Do not
-commit credentials, `.hytorch.env`, generated model workspaces, or agent
-session data.
+commit credentials, `.hytorch.env`, or generated model workspaces. Durable
+agent sessions belong inside generated model state. Do not add them to the
+source tree unless they are explicit test fixtures.
 
 Use short commit subjects in the imperative form. Explain design decisions and
 test results in the pull request description.

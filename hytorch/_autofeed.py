@@ -28,6 +28,7 @@ class Node:
     commit: str
     root: str
     workspace: str
+    parameter: str
     statespace: str
     workspace_revision: str
     consumed: bool = False
