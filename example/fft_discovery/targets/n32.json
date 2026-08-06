@@ -1,0 +1,24 @@
+{
+  "cost_model": {
+    "add": 1,
+    "fused_operations": "not allowed",
+    "multiplication_by_one_or_minus_one": 0,
+    "negation": 0,
+    "nontrivial_real_scale": 1,
+    "sub": 1
+  },
+  "format": "hytorch-fft-target-v1",
+  "incumbent": {
+    "name": "32-point split-radix FFT",
+    "source": "Haynal and Haynal, Generating and Searching Families of FFT Algorithms, arXiv:1103.5740v2, Table 1; Johnson and Frigo, IEEE TSP 55(1), 2007",
+    "total_operations": 456
+  },
+  "input_order": "x0.real, x0.imag, x1.real, x1.imag, ...",
+  "limits": {
+    "max_operations": 5000
+  },
+  "n": 32,
+  "output_order": "X0.real, X0.imag, X1.real, X1.imag, ...",
+  "status": "frozen",
+  "transform": "unscaled complex-input DFT with negative exponential sign"
+}

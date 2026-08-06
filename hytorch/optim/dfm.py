@@ -1,10 +1,12 @@
-"""Directional Feedback Mutation over candidate workspace branches."""
+"""Directional Feedback Mutation for persistent agent Parameters."""
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
+import shutil
 import tempfile
 import time
 from collections import defaultdict
@@ -18,34 +20,49 @@ from ..harness import registered
 from ..parameter import (
     Parameter,
     ParameterStore,
-    create_workspace_checkout,
+    copy_tree,
     set_tree_writable,
     tree_manifest,
+    validate_agent_state,
 )
 from ..space import Space
 from .optimizer import Optimizer, _release
 
 
-@dataclasses.dataclass
-class _PendingUpdate:
-    store: ParameterStore
-    branch: str
-    root: str
-    base: str
-    before: dict[str, dict[str, bytes]]
+@dataclasses.dataclass(frozen=True)
+class FeedRecord:
+    """One reproducible mutation direction for an owner Parameter."""
+
+    text: str
+    layer: str
+    agent: int
+    session: str
+    output_commit: str
+    input_commits: tuple[str, ...]
+    downstream: tuple[str, ...]
+    harness: str
+    mtype: str | None
+    digest: str
 
 
 @dataclasses.dataclass
 class _NodeUpdate:
     context: Node
+    update: str
     upstream: list[str]
-    workspace_base: str
-    workspace_head: str
-    workspace_path: str
+    downstream: tuple[str, ...]
+
+
+@dataclasses.dataclass
+class _Candidate:
+    store: ParameterStore
+    branch: str
+    root: str
+    base: str
 
 
 class DFM(Optimizer):
-    """Generate workspace candidates during backward and promote them in step."""
+    """Accumulate directional feed and update each Parameter once in step()."""
 
     def __init__(
         self,
@@ -67,13 +84,17 @@ class DFM(Optimizer):
             )
         self.temp = float(temp)
         self.max_tokens = max_tokens
-        self._pending: _PendingUpdate | None = None
+        self._records: dict[tuple[int, str], list[FeedRecord]] = defaultdict(list)
+        self._views = {}
+        self._pending: _Candidate | None = None
 
-    def _backward(self, output: Space, feedback: str) -> None:
-        if self._pending is not None:
-            raise RuntimeError(
-                "hytorch.optim.DFM: call step() or zero_feed() before another backward pass"
-            )
+    def _backward(
+        self,
+        output: Space,
+        feedback: str,
+        *,
+        retain_graph: bool = False,
+    ) -> None:
         nodes = ancestors([output.feed_fn])
         views = [view for node in nodes for view in node.parameters]
         if not views:
@@ -89,39 +110,41 @@ class DFM(Optimizer):
             raise RuntimeError(
                 "hytorch.optim.DFM: optimizer does not own every executed Parameter"
             )
-
-        store = next(iter(stores.values()))
-        base = store.repo.resolve("HEAD")
-        branch = f"hytorch/dfm/{time.time_ns()}"
-        candidate_root = tempfile.mkdtemp(prefix="hytorch-dfm-")
-        store.repo.branch(branch, base)
-        store.repo.add_worktree(candidate_root, branch)
-        before = {
-            view.relative_path: tree_manifest(
-                os.path.join(store.root, view.relative_path)
+        if self._pending is not None:
+            raise RuntimeError(
+                "hytorch.optim.DFM: an earlier step candidate has not been resolved"
             )
-            for parameter in self.params
-            for view in parameter.views()
-        }
-        pending = _PendingUpdate(store, branch, candidate_root, base, before)
 
         try:
-            self._run_backward(nodes, output.feed_fn, feedback, pending)
+            updates = self._run_backward(nodes, output.feed_fn, feedback)
+            for value in updates:
+                view = value.context.parameters[0]
+                if not view.parameter.requires_feed:
+                    value.context.feed = value.downstream
+                    value.context.applied = True
+                    continue
+                record = _feed_record(value)
+                key = (id(view.parameter._store), view.relative_path)
+                self._records[key].append(record)
+                self._views[key] = view
+                view._accumulate_feed(value.update)
+                value.context.feed = value.downstream
+                value.context.applied = True
+            if not retain_graph:
+                for node in nodes:
+                    node.consumed = True
+                    if not node.released:
+                        _release(node)
         except Exception:
             for node in nodes:
+                node.consumed = True
                 if not node.released:
                     _release(node)
-            self._remove_pending(pending)
             raise
-        self._pending = pending
 
     def _run_backward(
-        self,
-        nodes: list[Node],
-        output_node: Node,
-        feedback: str,
-        pending: _PendingUpdate,
-    ) -> None:
+        self, nodes: list[Node], output_node: Node, feedback: str
+    ) -> list[_NodeUpdate]:
         children: dict[Node, set[Node]] = {node: set() for node in nodes}
         for node in nodes:
             for parent in node.parents:
@@ -131,88 +154,47 @@ class DFM(Optimizer):
         queue = [node for node in nodes if remaining[node] == 0]
         downstream: dict[Node, list[str]] = defaultdict(list)
         downstream[output_node].append(feedback)
-        processed = 0
+        completed: list[_NodeUpdate] = []
 
         while queue:
-            ready = queue
-            queue = []
-            while ready:
-                selected: list[Node] = []
-                deferred: list[Node] = []
-                workspace_paths: set[str] = set()
-                for node in ready:
-                    if len(node.parameters) != 1:
-                        raise RuntimeError(
-                            "hytorch.optim.DFM: one agent must own one workspace"
-                        )
-                    path = node.parameters[0].relative_path
-                    if path in workspace_paths:
-                        deferred.append(node)
-                    else:
-                        workspace_paths.add(path)
-                        selected.append(node)
-
-                workspace_base = pending.store.repo.resolve(pending.branch)
-                for node in selected:
-                    if not downstream[node]:
-                        raise RuntimeError(
-                            f"hytorch.optim.DFM: node {node.layer}[{node.agent}] "
-                            "received no feedback"
-                        )
-                with ThreadPoolExecutor(max_workers=len(selected)) as executor:
-                    futures = [
-                        executor.submit(
-                            self._update_node,
-                            node,
-                            downstream[node],
-                            pending,
-                            workspace_base,
-                        )
-                        for node in selected
-                    ]
-                    updates = [future.result() for future in futures]
-                self._integrate_updates(updates, pending)
-
-                for update in updates:
-                    node = update.context
-                    processed += 1
-                    for input_index, value in enumerate(node.inputs):
-                        parent = value.feed_fn
-                        if parent is not None and parent in remaining:
-                            downstream[parent].append(update.upstream[input_index])
-                    for parent in node.parents:
-                        if parent not in remaining:
-                            continue
+            ready, queue = queue, []
+            for node in ready:
+                if not downstream[node]:
+                    raise RuntimeError(
+                        f"hytorch.optim.DFM: node {node.layer}[{node.agent}] received no feedback"
+                    )
+            with ThreadPoolExecutor(max_workers=len(ready)) as executor:
+                futures = [
+                    executor.submit(self._update_node, node, downstream[node])
+                    for node in ready
+                ]
+                updates = [future.result() for future in futures]
+            completed.extend(updates)
+            for update in updates:
+                node = update.context
+                for index, value in enumerate(node.inputs):
+                    parent = value.feed_fn
+                    if parent is not None and parent in remaining:
+                        downstream[parent].append(update.upstream[index])
+                for parent in node.parents:
+                    if parent in remaining:
                         remaining[parent] -= 1
                         if remaining[parent] == 0:
                             queue.append(parent)
-                ready = deferred
-
-        if processed != len(nodes):
+        if len(completed) != len(nodes):
             raise RuntimeError("hytorch.optim.DFM: backward graph contains a cycle")
+        return completed
 
-    def _update_node(
-        self,
-        context: Node,
-        messages: list[str],
-        pending: _PendingUpdate,
-        workspace_base: str,
-    ) -> _NodeUpdate:
+    def _update_node(self, context: Node, messages: list[str]) -> _NodeUpdate:
         if len(context.parameters) != 1:
             raise RuntimeError("hytorch.optim.DFM: one agent must own one workspace")
-        view = context.parameters[0]
-        set_tree_writable(context.workspace, True)
-        workspace_repo = create_workspace_checkout(
-            pending.store.root,
-            workspace_base,
-            view.relative_path,
-            context.workspace,
-        )
         set_tree_writable(context.statespace, False)
+        set_tree_writable(context.parameter, False)
         statespace_repo = Repo.discover(context.statespace)
         statespace_head = statespace_repo.resolve("HEAD")
-        statespace_before = tree_manifest(context.statespace)
-
+        statespace_before = tree_manifest(context.statespace, include_git=True)
+        parameter_before = tree_manifest(context.parameter)
+        view = context.parameters[0]
         prompt = _backward_prompt(
             context.layer,
             context.agent,
@@ -222,142 +204,220 @@ class DFM(Optimizer):
             self.temp,
         )
         try:
-            try:
-                harness = registered()[context.harness]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"hytorch.optim.DFM: harness {context.harness!r} is not registered"
-                ) from exc
-            summary = harness.resume(
-                context.session,
-                context.root,
-                prompt,
-                context.mtype,
-                temperature=self.temp,
-                max_tokens=self.max_tokens,
-                read_only=(context.statespace,),
+            harness = registered()[context.harness]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"hytorch.optim.DFM: harness {context.harness!r} is not registered"
+            ) from exc
+        result = harness.resume(
+            context.session,
+            context.root,
+            prompt,
+            context.mtype,
+            temperature=self.temp,
+            max_tokens=self.max_tokens,
+            read_only=(context.statespace, context.parameter),
+        )
+        context.session = result.session
+        if tree_manifest(context.statespace, include_git=True) != statespace_before:
+            raise ValueError(
+                "hytorch.optim.DFM: backward modified the read-only statespace"
             )
-            if tree_manifest(context.statespace) != statespace_before:
-                raise ValueError(
-                    "hytorch.optim.DFM: backward modified the read-only statespace"
-                )
-            if statespace_repo.resolve("HEAD") != statespace_head:
-                raise ValueError(
-                    "hytorch.optim.DFM: backward changed statespace Git history"
-                )
-            if not statespace_repo.is_clean():
-                raise ValueError("hytorch.optim.DFM: backward left statespace changes")
-            _validate_node_root(context.root)
-            if not workspace_repo.is_clean():
-                raise RuntimeError(
-                    f"hytorch.optim.DFM: node {context.layer}[{context.agent}] "
-                    "finished with uncommitted workspace changes"
-                )
-            upstream = _read_upstream(summary, len(context.inputs))
-            workspace_head = workspace_repo.resolve("HEAD")
-            if not workspace_repo.is_ancestor(workspace_base, workspace_head):
-                raise RuntimeError(
-                    f"hytorch.optim.DFM: node {context.layer}[{context.agent}] "
-                    "rewrote global workspace history"
-                )
-            changed_paths = set(
-                workspace_repo.changed_paths(workspace_base, workspace_head)
+        if (
+            statespace_repo.resolve("HEAD") != statespace_head
+            or not statespace_repo.is_clean()
+        ):
+            raise ValueError(
+                "hytorch.optim.DFM: backward changed statespace Git history"
             )
-            prefix = view.relative_path
-            illegal = sorted(
-                path
-                for path in changed_paths
-                if path != prefix and not path.startswith(prefix + "/")
+        if tree_manifest(context.parameter) != parameter_before:
+            raise ValueError(
+                "hytorch.optim.DFM: backward modified the read-only Parameter"
             )
-            if illegal:
-                raise ValueError(
-                    "hytorch.optim.DFM: backward changed paths outside its workspace: "
-                    + ", ".join(illegal)
-                )
-            for message in messages:
-                view._accumulate_feed(message)
-            context.feed = tuple(messages)
-            context.applied = True
-            context.consumed = True
-            return _NodeUpdate(
-                context=context,
-                upstream=upstream,
-                workspace_base=workspace_base,
-                workspace_head=workspace_head,
-                workspace_path=view.relative_path,
-            )
-        finally:
-            _release(context)
-
-    def _integrate_updates(
-        self,
-        updates: list[_NodeUpdate],
-        pending: _PendingUpdate,
-    ) -> None:
-        for update in updates:
-            if update.workspace_head == update.workspace_base:
-                continue
-            imported_branch = f"hytorch/import/{time.time_ns()}-{update.context.agent}"
-            imported = pending.store.repo.import_commit(
-                update.context.workspace,
-                update.workspace_head,
-                imported_branch,
-            )
-            try:
-                current = pending.store.repo.resolve(pending.branch)
-                if current == update.workspace_base:
-                    pending.store.repo.fast_forward(pending.root, imported)
-                else:
-                    pending.store.repo.merge_branches(pending.root, [imported])
-            finally:
-                pending.store.repo.delete_branch(imported_branch)
+        _validate_node_root(context.root)
+        validate_agent_state(context.workspace)
+        update, upstream = _read_response(result.text, len(context.inputs))
+        return _NodeUpdate(context, update, upstream, tuple(messages))
 
     def step(self) -> None:
-        """Promote the complete candidate workspace branch."""
-        pending = self._pending
-        if pending is None:
+        """Reduce all accumulated feed into one atomic Parameter generation."""
+        if not self._records:
             return None
-        report = Report()
+        stores = {
+            id(view.parameter._store): view.parameter._store
+            for view in self._views.values()
+        }
+        if len(stores) != 1 or None in stores.values():
+            raise RuntimeError(
+                "hytorch.optim.DFM: step requires one model workspace store"
+            )
+        store = next(iter(stores.values()))
+        candidate = self._create_candidate(store)
+        self._pending = candidate
+        before = {
+            view.relative_path: tree_manifest(
+                os.path.join(store.root, view.relative_path)
+            )
+            for view in self._views.values()
+        }
         try:
-            if pending.store.repo.resolve("HEAD") != pending.base:
-                raise RuntimeError(
-                    "hytorch.optim.DFM: canonical model changed after backward; "
-                    "discarding the stale candidate"
-                )
-            candidate = pending.store.repo.resolve(pending.branch)
-            if candidate != pending.base:
-                pending.store.repo.merge_branches(pending.store.root, [candidate])
-                canonical = pending.store.repo.resolve("HEAD")
-                report.commits.append(canonical)
-            for relative, before in pending.before.items():
-                after = tree_manifest(os.path.join(pending.store.root, relative))
-                for path in sorted(set(before) | set(after)):
-                    if before.get(path) == after.get(path):
-                        continue
-                    report.revised[os.path.join(relative, path)] = WorkspaceRevision(
-                        before=_as_text(before.get(path)),
-                        after=_as_text(after.get(path)),
+            keys = sorted(self._records, key=lambda item: item[1])
+            with ThreadPoolExecutor(max_workers=len(keys)) as executor:
+                futures = [
+                    executor.submit(
+                        self._reduce_owner,
+                        candidate,
+                        self._views[key],
+                        self._records[key],
                     )
+                    for key in keys
+                ]
+                for future in futures:
+                    future.result()
+            candidate.store.repo.commit_all_workdir(
+                candidate.root, "hytorch: apply directional feedback"
+            )
+            if candidate.store.repo.resolve("HEAD") != candidate.base:
+                raise RuntimeError(
+                    "hytorch.optim.DFM: canonical model changed during step"
+                )
+            revision = candidate.store.repo.resolve(candidate.branch)
+            if revision != candidate.base:
+                candidate.store.repo.merge_branches(candidate.store.root, [revision])
+            report = Report()
+            canonical = candidate.store.repo.resolve("HEAD")
+            if canonical != candidate.base:
+                report.commits.append(canonical)
+            for relative, old in before.items():
+                new = tree_manifest(os.path.join(store.root, relative))
+                for path in sorted(set(old) | set(new)):
+                    if old.get(path) != new.get(path):
+                        report.revised[os.path.join(relative, path)] = (
+                            WorkspaceRevision(
+                                before=_as_text(old.get(path)),
+                                after=_as_text(new.get(path)),
+                            )
+                        )
             self.state["last_report"] = report
+        except Exception:
+            # Feed remains available so the caller can retry or call zero_feed().
+            raise
         finally:
-            self._remove_pending(pending)
+            self._remove_candidate(candidate)
             self._pending = None
         return None
 
+    def _reduce_owner(
+        self, candidate: _Candidate, view, records: list[FeedRecord]
+    ) -> None:
+        root = tempfile.mkdtemp(prefix="hytorch-owner-")
+        statespace = os.path.join(root, "statespace")
+        parameter = os.path.join(root, "parameter")
+        workspace = os.path.join(root, "workspace")
+        source = os.path.join(candidate.root, view.relative_path)
+        copy_tree(source, parameter)
+        copy_tree(source, workspace)
+        set_tree_writable(parameter, False)
+        repo, _ = Repo.create_integration(statespace, [])
+        evidence = [
+            dataclasses.asdict(value) for value in sorted(records, key=_record_key)
+        ]
+        with open(
+            os.path.join(statespace, "feeds.json"), "w", encoding="utf-8"
+        ) as file:
+            json.dump(evidence, file, indent=2, sort_keys=True)
+            file.write("\n")
+        repo.commit_allow_empty(statespace, "hytorch: record accumulated feed")
+        set_tree_writable(statespace, False)
+        harness_names = {value.harness for value in records}
+        model_types = {value.mtype for value in records}
+        if len(harness_names) != 1 or len(model_types) != 1:
+            raise RuntimeError(
+                "hytorch.optim.DFM: one Parameter cannot mix harnesses or model types before step"
+            )
+        harness = registered()[next(iter(harness_names))]
+        prompt = _step_prompt(view.relative_path, len(records), self.temp)
+        result = None
+        try:
+            result = harness.start(
+                root,
+                prompt,
+                next(iter(model_types)),
+                temperature=self.temp,
+                max_tokens=self.max_tokens,
+                read_only=(statespace, parameter),
+            )
+            if tree_manifest(parameter) != tree_manifest(source):
+                raise ValueError(
+                    "hytorch.optim.DFM: step modified the read-only Parameter"
+                )
+            validate_agent_state(workspace)
+            _validate_node_root(root)
+            copy_tree(workspace, source)
+        finally:
+            if result is not None:
+                harness.close(result.session)
+            set_tree_writable(parameter, True)
+            set_tree_writable(statespace, True)
+            shutil.rmtree(root, ignore_errors=True)
+
+    def _create_candidate(self, store: ParameterStore) -> _Candidate:
+        base = store.repo.resolve("HEAD")
+        branch = f"hytorch/dfm/{time.time_ns()}"
+        root = tempfile.mkdtemp(prefix="hytorch-dfm-")
+        store.repo.branch(branch, base)
+        store.repo.add_worktree(root, branch)
+        return _Candidate(store, branch, root, base)
+
     def _discard_pending(self) -> None:
-        if self._pending is None:
-            return
-        self._remove_pending(self._pending)
-        self._pending = None
+        if self._pending is not None:
+            self._remove_candidate(self._pending)
+            self._pending = None
+        self._records.clear()
+        self._views.clear()
 
     @staticmethod
-    def _remove_pending(pending: _PendingUpdate) -> None:
-        if os.path.isdir(pending.root):
-            pending.store.repo.remove_worktree(pending.root)
+    def _remove_candidate(candidate: _Candidate) -> None:
+        if os.path.isdir(candidate.root):
+            candidate.store.repo.remove_worktree(candidate.root)
         try:
-            pending.store.repo.delete_branch(pending.branch)
+            candidate.store.repo.delete_branch(candidate.branch)
         except Exception:
             pass
+
+
+def _feed_record(value: _NodeUpdate) -> FeedRecord:
+    context = value.context
+    payload = {
+        "text": value.update,
+        "layer": context.layer,
+        "agent": context.agent,
+        "session": context.session.id,
+        "output_commit": context.commit,
+        "input_commits": [item.commit for item in context.inputs],
+        "downstream": list(value.downstream),
+        "harness": context.harness,
+        "mtype": context.mtype,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return FeedRecord(
+        text=value.update,
+        layer=context.layer,
+        agent=context.agent,
+        session=context.session.id,
+        output_commit=context.commit,
+        input_commits=tuple(item.commit for item in context.inputs),
+        downstream=value.downstream,
+        harness=context.harness,
+        mtype=context.mtype,
+        digest=digest,
+    )
+
+
+def _record_key(value: FeedRecord) -> tuple:
+    return (value.layer, value.agent, value.output_commit, value.session, value.digest)
 
 
 def _backward_prompt(
@@ -365,44 +425,48 @@ def _backward_prompt(
     agent: int,
     inputs: int,
     messages: list[str],
-    workspace_path: str,
+    parameter_path: str,
     temp: float,
 ) -> str:
     rendered = "\n\n".join(
         f"## Direction {index}\n\n{message}" for index, message in enumerate(messages)
     )
     return (
-        f"Resume node {layer}[{agent}] for backward.\n\n"
-        "The node root contains two self-contained Git states:\n"
-        "- statespace/: read-only forward result and input refs\n"
-        "- workspace/: writable sparse checkout with full model history\n\n"
-        f"Your writable workspace is workspace/{workspace_path}/. "
-        "Do not change any other model path.\n\n"
+        f"Resume temporary episode {layer}[{agent}] for backward.\n\n"
+        "statespace/ and parameter/ are read-only. workspace/ is temporary episode "
+        "state. HyTorch will discard it after backward. Do not update your persistent "
+        f"state now. Propose one update for Parameter {parameter_path}.\n\n"
         f"# Directional feedback\n\n{rendered}\n\n"
-        "Use the feedback to improve workspace/. You can leave the workspace "
-        "unchanged. Commit all workspace changes before ending your turn and leave "
-        "the repository clean. Each commit becomes part of the global model history. "
-        "HyTorch combines commits from dependency-ready agents and step() promotes "
-        "the completed candidate. Do not modify statespace/.\n\n"
         "Return only one JSON object with this shape:\n"
-        f'{{"feedback": [<one imperative direction for each of the {inputs} input refs>]}}\n\n'
-        f"Mutation temperature: {temp}. Use this as the semantic scale of the change.\n"
-        "Finish the workspace commits and JSON response before ending your turn."
+        f'{{"update": "<one imperative owner update>", "feedback": [<one imperative direction for each of the {inputs} inputs>]}}\n\n'
+        f"Mutation temperature: {temp}."
     )
 
 
-def _read_upstream(text: str, count: int) -> list[str]:
+def _step_prompt(parameter_path: str, count: int, temp: float) -> str:
+    return (
+        f"Update your persistent native state for Parameter {parameter_path}.\n\n"
+        "parameter/ is the read-only state before this optimizer step. workspace/ is "
+        "your writable state. statespace/feeds.json contains all accumulated feed with "
+        "provenance. Inspect it. Resolve duplicate or conflicting directions. Update "
+        "workspace/ once. You may change memories, instructions, skills, settings, "
+        "sessions, databases, or other useful native state. Do not use Git in workspace/. "
+        f"There are {count} feed records. Mutation temperature: {temp}. Finish the update."
+    )
+
+
+def _read_response(text: str, count: int) -> tuple[str, list[str]]:
     try:
         value = json.loads(text)
     except (TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             "hytorch.optim.DFM: backward response must be one JSON object"
         ) from exc
-    if not isinstance(value, dict) or set(value) != {"feedback"}:
+    if not isinstance(value, dict) or set(value) != {"update", "feedback"}:
         raise RuntimeError(
-            "hytorch.optim.DFM: backward response must contain only 'feedback'"
+            "hytorch.optim.DFM: backward response must contain 'update' and 'feedback'"
         )
-    feedback = value["feedback"]
+    feedback = value.get("feedback")
     if not isinstance(feedback, list) or len(feedback) != count:
         raise RuntimeError(
             f"hytorch.optim.DFM: backward response requires {count} feedback strings"
@@ -411,22 +475,25 @@ def _read_upstream(text: str, count: int) -> list[str]:
         raise RuntimeError(
             "hytorch.optim.DFM: every upstream feedback value must be non-empty text"
         )
-    return [item.strip() for item in feedback]
+    update = value["update"]
+    if not isinstance(update, str) or not update.strip():
+        raise RuntimeError("hytorch.optim.DFM: owner update must be non-empty text")
+    return update.strip(), [item.strip() for item in feedback]
 
 
 def _validate_node_root(root: str) -> None:
-    unexpected = sorted(set(os.listdir(root)) - {"statespace", "workspace"})
+    unexpected = sorted(
+        set(os.listdir(root)) - {"statespace", "parameter", "workspace"}
+    )
     if unexpected:
         raise ValueError(
-            "hytorch.optim.DFM: backward changed paths outside the workspace: "
+            "hytorch.optim.DFM: agent changed paths outside the node state: "
             + ", ".join(unexpected)
         )
 
 
 def _as_text(value: bytes | None) -> str:
-    if value is None:
-        return ""
-    return value.decode("utf-8", errors="replace")
+    return "" if value is None else value.decode("utf-8", errors="replace")
 
 
-__all__ = ["DFM"]
+__all__ = ["DFM", "FeedRecord"]

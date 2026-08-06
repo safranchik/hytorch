@@ -15,7 +15,32 @@ from collections.abc import Iterator, Mapping
 PROJECT_ENV = ".hytorch.env"
 GLOBAL_ENV = os.path.join("hytorch", "secrets.env")
 EXPLICIT_ENV = "HYTORCH_ENV_FILE"
-KNOWN_PROVIDER_KEYS = ("OPENAI_API_KEY",)
+KNOWN_PROVIDER_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CODEX_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GOOGLE_API_KEY",
+    "GROQ_API_KEY",
+    "NOUS_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "TOGETHER_API_KEY",
+)
+RUNTIME_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "NODE_EXTRA_CA_CERTS",
+    "NO_PROXY",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+)
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _warned_tracked: set[str] = set()
 _warning_lock = threading.Lock()
@@ -66,6 +91,19 @@ def agent_environment(start: str | None = None) -> dict[str, str]:
         if name in os.environ:
             values[name] = os.environ[name]
     return values
+
+
+def command_environment(
+    start: str | None = None, *, values: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Build a minimal process environment plus declared agent values."""
+    environment = {
+        name: os.environ[name] for name in RUNTIME_ENV_KEYS if name in os.environ
+    }
+    environment.update(agent_environment(start))
+    if values is not None:
+        environment.update(values)
+    return environment
 
 
 @contextlib.contextmanager
@@ -160,6 +198,7 @@ __all__ = [
     "KNOWN_PROVIDER_KEYS",
     "PROJECT_ENV",
     "agent_environment",
+    "command_environment",
     "docker_environment_file",
     "environment_files",
     "project_root",

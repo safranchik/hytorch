@@ -20,7 +20,10 @@ data from the report.
 HyTorch executes coding agents against directory trees and Git repositories.
 Treat agent output and model-generated code as untrusted. Use isolated Docker
 environments. Use credentials with the least required privilege. Review
-workspace mutations before you use a trained model in a sensitive system.
+promoted native agent state before you use a trained model in a sensitive
+system. Native state can contain transcripts, tool results, memories, and
+executable files. HyTorch rejects Git metadata, escaping symlinks, special
+files, states with more than 100,000 files, and states larger than 2 GiB.
 
 HyTorch does not load a project `.env` file. Store agent variables in
 `.hytorch.env`, the global HyTorch secrets file, or the file selected by

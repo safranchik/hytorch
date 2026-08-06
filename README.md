@@ -17,7 +17,7 @@ plain-language feedback.
 
 - Python 3.11 or later
 - Git
-- Docker
+- One supported agent CLI or the packaged Pi Docker runtime
 
 ### Installation
 
@@ -105,7 +105,7 @@ print(output.commit)  # immutable Git identity
 The result is another complete Git-backed directory. The agents decide which
 files to create or change, then commit their work. `output.dir` is the output
 directory. `output.commit` identifies its exact contents. Inference mode
-closes the agent sessions after the result is complete.
+closes runtime resources and discards all private agent-state changes.
 
 ### Improve the network with feedback
 
@@ -138,10 +138,11 @@ Test malformed inputs before you select an implementation.
 Keep contradictory evidence and explain how you resolved it.
 ```
 
-This lifecycle mirrors PyTorch training. `zero_feed()` clears feedback from the
-previous iteration. `backward()` resumes the agents and creates candidate
-workspace changes. `step()` promotes all completed changes as one new model
-generation.
+This lifecycle mirrors PyTorch training. `zero_feed()` clears feed from the
+previous iteration. Forward runs a disposable episode fork. `backward()`
+resumes the episode and accumulates owner mutation feed. `step()` resumes each
+persistent owner once with all accumulated feed. It promotes all updates as
+one model generation.
 
 ### Save and load model state
 
@@ -171,10 +172,12 @@ model.load_state_dir(hytorch.load("model-state"))
 ```
 
 A `StateDir` identifies one immutable model commit. The saved directory
-contains `MODEL.json`, every registered workspace, and the canonical model Git
-history. Loading is strict by default. Pass `strict=False` to permit missing or
-unexpected workspace keys with compatible shapes. The save destination must
-not already exist.
+contains `MODEL.json`, every complete native agent state, and the canonical
+model Git history. Native state can include transcripts, memories, compaction
+records, skills, settings, and databases. It never includes credentials or
+live process state. Loading is strict by default. Pass `strict=False` to permit
+missing or unexpected workspace keys with compatible shapes. The save
+destination must not already exist.
 
 ## PyTorch-shaped composition
 
@@ -199,25 +202,30 @@ directory-backed workspace for each output agent. Its physical weight shape is
 `(out_features,)`. Every output receives every input Space, so the logical
 layer is dense.
 
-The `bias` argument initializes each workspace's mutable `AGENTS.md`.
-Optimization can later add instructions, code, tools, examples, and data.
+The `bias` argument initializes each workspace's mutable `AGENTS.md`. The
+native harness and agent can later replace or extend the complete state in any
+format.
 
 ## How one agent runs
 
-Each output agent receives two sibling directory trees:
+Each output agent receives three sibling directory trees:
 
 ```text
 node/
 ├── statespace/    # activation: writable during forward
-└── workspace/     # parameter: writable during backward
+├── parameter/     # read-only canonical native state
+└── workspace/     # writable temporary episode fork
 ```
 
 During forward, the agent merges every input statespace, transforms the merged
-tree, and commits the result. Its workspace is read-only.
+tree, and commits the result. Its native transcript, memory, and other local
+state can change inside the episode, but forward never changes the Parameter.
 
-During backward, HyTorch resumes the same agent session. The statespace is now
-read-only. The agent can mutate and commit its candidate workspace. Git records
-each activation, workspace diff, and promoted model generation.
+During backward, HyTorch resumes the episode. The statespace and Parameter are
+read-only. The episode returns one owner proposal and one direction per input.
+HyTorch accumulates these proposals in `.feed` and discards the episode.
+`step()` resumes the persistent owner once and lets it update its complete
+native state from all accumulated feed.
 
 ## Harnesses and environment
 
@@ -228,8 +236,26 @@ model.to("pi")
 model.to(harness="pi", mtype="gpt-5.6-terra")
 ```
 
-The built-in harness identities are `pi`, `codex`, and `claude-code`. Only Pi
-executes in 0.1.0. Pi uses `gpt-5.6-terra` by default.
+The built-in harness identities are `pi`, `codex`, `claude-code`, `opencode`,
+`hermes`, and `prime-agent`. Pi uses `gpt-5.6-terra` by default. Each harness
+uses its native local profile and session format inside the Parameter.
+
+| Identity | Runtime | Persisted native state |
+|---|---|---|
+| `pi` | Packaged Pi SDK runtime | Pi profile and JSONL session |
+| `codex` | `codex` CLI | `CODEX_HOME`, transcript, and project memory |
+| `claude-code` | `claude` CLI | Claude config, projects, and JSONL session |
+| `opencode` | `opencode` CLI | Isolated home and all XDG state directories |
+| `hermes` | `hermes` CLI | `HERMES_HOME`, `state.db`, memories, skills, and profile |
+| `prime-agent` | `prime-agent` CLI | Profile, JSONL session, RLM children, and session artifacts |
+
+You can construct a harness when you need a custom binary, model, provider,
+or external credential sidecar:
+
+```python
+harness = hytorch.harness.CodexHarness(binary="codex")
+model.to(harness)
+```
 
 Agent variables come from `~/.config/hytorch/secrets.env`, project
 `.hytorch.env`, `HYTORCH_ENV_FILE`, and exported shell variables, in increasing
@@ -246,10 +272,9 @@ values in prompts or Git state.
 HyTorch 0.1.0 is the first public alpha release. Run agents in isolated
 environments and review agent-created changes before production use.
 
-Version 0.1.0 includes Spaces, Parameters, dynamic Module graphs, dense Linear
-layers, directional backward feedback, atomic DFM optimizer generations, and
-the Dockerized Pi harness. The `codex` and `claude-code` harnesses are reserved
-but unavailable.
+Version 0.1.0 includes Spaces, native-state Parameters, dynamic Module graphs,
+dense Linear layers, directional backward feedback, atomic DFM optimizer
+generations, and six native agent harnesses.
 
 ## Resources
 

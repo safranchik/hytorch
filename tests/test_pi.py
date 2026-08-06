@@ -12,11 +12,12 @@ HYTORCH_PI_PROVIDER=openai in that case).
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
 import hytorch
-from hytorch.pi_harness import PiRuntime
+from hytorch.pi_harness import PiRuntime, _staged_agent_directory
 
 
 def test_pi_harness_defaults_to_terra():
@@ -170,20 +171,22 @@ def test_remote_context_uses_volume_transport(monkeypatch, tmp_path):
         read_only=(str(statespace),),
         environment_path=str(environment),
         provider="openai",
+        agent_dir=str(tmp_path / "agent"),
     )
 
     run = next(
         args for args in calls if args[:4] == ["docker", "run", "--rm", "--init"]
     )
     assert result.returncode == 0
-    assert len(uploads) == 4
+    assert len(uploads) == 5
     assert not any(destination == str(statespace) for _, destination in downloads)
     assert any(destination == str(workspace) for _, destination in downloads)
     assert any(destination == str(session) for _, destination in downloads)
+    assert any(destination == str(tmp_path / "agent") for _, destination in downloads)
     assert any("dst=/workspace/statespace,readonly" in arg for arg in run)
     assert any("dst=/workspace/workspace" in arg for arg in run)
     assert run[run.index("--env-file") + 1] == str(environment)
-    assert len([args for args in calls if args[1:3] == ["volume", "rm"]]) == 4
+    assert len([args for args in calls if args[1:3] == ["volume", "rm"]]) == 5
 
 
 def test_docker_context_detection_recognizes_remote_endpoint(monkeypatch):
@@ -199,6 +202,83 @@ def test_docker_context_detection_recognizes_remote_endpoint(monkeypatch):
     )
 
     assert harness._uses_remote_docker()
+
+
+def test_pi_start_continues_node_session_across_epochs(tmp_path, monkeypatch):
+    root = tmp_path / "node"
+    (root / "workspace").mkdir(parents=True)
+    calls = []
+    harness = PiRuntime(docker=False)
+
+    def fake_invoke(directory, prompt, mtype, **kwargs):
+        calls.append(kwargs["session_file"])
+        session_file = kwargs["session_file"]
+        if session_file is None:
+            session_file = os.path.join(kwargs["session_dir"], "native.jsonl")
+            with open(session_file, "w", encoding="utf-8") as file:
+                file.write('{"type":"session","id":"native"}\n')
+        return prompt, "native", session_file, hytorch.harness.Usage()
+
+    monkeypatch.setattr(harness, "_invoke", fake_invoke)
+
+    first = harness.start(str(root), "epoch one", None)
+    second = harness.start(str(root), "epoch two", None)
+
+    assert calls == [None, first.session.storage]
+    assert second.session.id == first.session.id
+    assert second.session.storage.startswith(str(root / "workspace"))
+
+
+def test_pi_resume_returns_result_and_close_preserves_session(tmp_path, monkeypatch):
+    root = tmp_path / "node"
+    session_dir = root / "workspace" / ".pi" / "sessions"
+    session_dir.mkdir(parents=True)
+    session_file = session_dir / "native.jsonl"
+    session_file.write_text("session\n", encoding="utf-8")
+    harness = PiRuntime(docker=False)
+    session = hytorch.harness.Session("pi", "native", str(session_file))
+    monkeypatch.setattr(
+        harness,
+        "_invoke",
+        lambda *args, **kwargs: (
+            "updated",
+            "native",
+            str(session_file),
+            hytorch.harness.Usage(),
+        ),
+    )
+
+    result = harness.resume(session, str(root), "feedback", None)
+    harness.close(result.session)
+
+    assert isinstance(result, hytorch.harness.Result)
+    assert result.text == "updated"
+    assert session_file.is_file()
+
+
+def test_pi_profile_keeps_native_files_but_never_auth(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    operator = tmp_path / "home" / ".pi" / "agent"
+    operator.mkdir(parents=True)
+    (operator / "auth.json").write_text(
+        '{"openai-codex":{"expires":1,"access":"secret"}}', encoding="utf-8"
+    )
+    persistent = tmp_path / "candidate" / "agent"
+    persistent.mkdir(parents=True)
+    (persistent / "auth.json").write_text("leaked", encoding="utf-8")
+    (persistent / "settings.json").write_text("{}", encoding="utf-8")
+
+    with _staged_agent_directory(str(persistent)) as staged:
+        assert Path(staged, "auth.json").is_file()
+        Path(staged, "memory.md").write_text("learned", encoding="utf-8")
+        Path(staged, "auth.json").write_text(
+            '{"openai-codex":{"expires":2,"access":"refreshed"}}',
+            encoding="utf-8",
+        )
+
+    assert (persistent / "memory.md").read_text(encoding="utf-8") == "learned"
+    assert not (persistent / "auth.json").exists()
+    assert "refreshed" in (operator / "auth.json").read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(

@@ -7,7 +7,6 @@ from conftest import (
     commit_agent_changes,
     find_agent_workspace,
     merge_agent_inputs,
-    run_git,
 )
 
 import hytorch
@@ -22,15 +21,24 @@ class DirectionHarness(hytorch.harness.Harness):
         self.closed = []
         self.received = {}
         self.max_tokens = None
+        self.owner_reductions = []
 
     def start(self, directory, prompt, mtype, **kwargs):
         session = hytorch.harness.Session(self.name, f"session-{len(self.started)}", "")
         self.started.append(session)
+        workspace = find_agent_workspace(os.path.join(directory, "workspace"))
+        if prompt.startswith("Update your persistent native state"):
+            self.owner_reductions.append(prompt)
+            with open(os.path.join(workspace, "owner-update.md"), "w") as file:
+                file.write("Reduced all accumulated feed.\n")
+            return hytorch.harness.Result("finished owner update", session)
         statespace = os.path.join(directory, "statespace")
         merge_agent_inputs(statespace)
         with open(os.path.join(statespace, "answer.txt"), "a") as file:
             file.write(session.id + "\n")
         commit_agent_changes(statespace, "agent: finish forward")
+        with open(os.path.join(workspace, "forward-memory.md"), "w") as file:
+            file.write("This session completed a forward turn.\n")
         return hytorch.harness.Result("finished forward", session)
 
     def resume(self, session, directory, prompt, mtype, **kwargs):
@@ -41,7 +49,6 @@ class DirectionHarness(hytorch.harness.Harness):
         selected = find_agent_workspace(workspace)
         with open(os.path.join(selected, f"update-{session.id}.md"), "w") as file:
             file.write("Apply the received direction in future passes.\n")
-        commit_agent_changes(workspace, "agent: update workspace")
         input_count = len(
             os.listdir(
                 os.path.join(
@@ -49,17 +56,99 @@ class DirectionHarness(hytorch.harness.Harness):
                 )
             )
         )
-        return json.dumps(
-            {
-                "feedback": [
-                    f"Improve input {index} for {session.id}."
-                    for index in range(input_count)
-                ]
-            }
+        return hytorch.harness.Result(
+            json.dumps(
+                {
+                    "update": "Apply the received direction in future passes.",
+                    "feedback": [
+                        f"Improve input {index} for {session.id}."
+                        for index in range(input_count)
+                    ],
+                }
+            ),
+            session,
         )
 
     def close(self, session):
         self.closed.append(session)
+
+
+def test_two_forwards_accumulate_feed_and_step_reduces_owner_once(new_repo):
+    harness = hytorch.harness.register(DirectionHarness("accumulate"))
+    model = OneNode().to(harness)
+    optimizer = hytorch.optim.DFM(model.parameters())
+
+    first = model(hytorch.space(new_repo.root, harness=harness))
+    second = model(hytorch.space(new_repo.root, harness=harness))
+    hytorch.Loss(first, "Keep exact evidence.").backward()
+    hytorch.Loss(second, "Use a smaller proof.").backward()
+
+    assert model.layer.weight[0].feed == (
+        "Apply the received direction in future passes.",
+        "Apply the received direction in future passes.",
+    )
+    records = next(iter(optimizer._records.values()))
+    assert len(records) == 2
+    assert len({record.digest for record in records}) == 2
+
+    optimizer.step()
+
+    assert len(harness.owner_reductions) == 1
+
+
+def test_backward_retain_graph_matches_pytorch_lifecycle(new_repo):
+    harness = hytorch.harness.register(DirectionHarness("retain"))
+    model = OneNode().to(harness)
+    optimizer = hytorch.optim.DFM(model.parameters())
+    output = model(hytorch.space(new_repo.root, harness=harness))
+
+    hytorch.Loss(output, "Check correctness.").backward(retain_graph=True)
+    assert not output.feed_fn.consumed
+    assert not output.feed_fn.released
+    hytorch.Loss(output, "Check efficiency.").backward()
+    assert output.feed_fn.consumed
+    assert output.feed_fn.released
+    assert len(model.layer.weight[0].feed) == 2
+
+    with pytest.raises(RuntimeError, match="second time"):
+        hytorch.Loss(output, "Run again.").backward()
+    optimizer.step()
+
+
+def test_step_is_atomic_and_retains_feed_after_reducer_failure(new_repo):
+    class FailingReducer(DirectionHarness):
+        def start(self, directory, prompt, mtype, **kwargs):
+            if prompt.startswith(
+                "Update your persistent native state for Parameter layers/layer/1"
+            ):
+                raise RuntimeError("reducer failed")
+            return super().start(directory, prompt, mtype, **kwargs)
+
+    harness = hytorch.harness.register(FailingReducer("atomic"))
+    model = mn.Linear(1, 2, bias="Be exact.")
+
+    class TwoOwners(mn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layer = layer
+
+        def forward(self, value):
+            return self.layer(value)
+
+    network = TwoOwners(model).to(harness)
+    optimizer = hytorch.optim.DFM(network.parameters())
+    outputs = network(hytorch.space(new_repo.root, harness=harness))
+    before = model.weight[0].revision
+    hytorch.Loss(outputs[0], "Improve owner zero.").backward()
+    hytorch.Loss(outputs[1], "Improve owner one.").backward()
+
+    with pytest.raises(RuntimeError, match="reducer failed"):
+        optimizer.step()
+
+    assert model.weight[0].revision == before
+    assert model.weight[0].feed is not None
+    assert model.weight[1].feed is not None
+    optimizer.zero_feed()
 
 
 class OneNode(mn.Module):
@@ -85,7 +174,7 @@ def test_loss_contains_only_output_and_directional_feedback(new_repo):
         hytorch.Loss(output, score=0.0, critique="old API")
 
 
-def test_backward_updates_candidate_and_step_promotes_it(new_repo):
+def test_backward_accumulates_feed_and_step_updates_parameter(new_repo):
     harness = hytorch.harness.register(DirectionHarness("promote"))
     model = OneNode().to(harness)
     optimizer = hytorch.optim.DFM(model.parameters(), temp=0.4)
@@ -98,23 +187,24 @@ def test_backward_updates_candidate_and_step_promotes_it(new_repo):
     assert not os.path.exists(
         os.path.join(model.layer.weight[0].path, "update-session-0.md")
     )
+    assert not os.path.exists(
+        os.path.join(model.layer.weight[0].path, "forward-memory.md")
+    )
     assert output.feed_fn.released
     assert {session.id for session in harness.closed} == {
         session.id for session in harness.started
     }
-    assert model.layer.weight[0].feed == ("Use a stricter validation rule.",)
-    agent_commit = run_git(output.feed_fn.workspace, "rev-parse", "HEAD")
-    history = run_git(output.feed_fn.workspace, "log", "--format=%s")
-    assert "hytorch: initialize meta-network workspaces" in history
+    assert model.layer.weight[0].feed == (
+        "Apply the received direction in future passes.",
+    )
+    assert not os.path.exists(output.feed_fn.workspace)
 
     optimizer.step()
 
     assert model.layer.weight[0].revision != before
-    assert model.layer.weight._store.repo.is_ancestor(
-        agent_commit, model.layer.weight[0].revision
-    )
-    assert os.path.isfile(
-        os.path.join(model.layer.weight[0].path, "update-session-0.md")
+    assert os.path.isfile(os.path.join(model.layer.weight[0].path, "owner-update.md"))
+    assert not os.path.exists(
+        os.path.join(model.layer.weight[0].path, "forward-memory.md")
     )
 
 
@@ -138,14 +228,40 @@ def test_backward_propagates_separate_feedback_and_accumulates_fanout(new_repo):
 
     hytorch.Loss(output, "Prefer the smallest correct solution.").backward()
 
-    assert model.final.weight[0].feed == ("Prefer the smallest correct solution.",)
+    assert model.final.weight[0].feed == (
+        "Apply the received direction in future passes.",
+    )
     assert len(model.split.weight[0].feed) == 1
     assert len(model.split.weight[1].feed) == 1
-    assert len(model.first.weight[0].feed) == 2
+    assert len(model.first.weight[0].feed) == 1
     assert {session.id for session in harness.closed} == {
         session.id for session in harness.started
     }
     optimizer.step()
+
+
+def test_frozen_intermediate_parameter_propagates_without_feed(new_repo):
+    class FrozenMiddle(mn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = mn.Linear(1, 1, bias="Learn.")
+            self.middle = mn.Linear(1, 1, bias="Stay fixed.")
+            self.middle.weight.requires_feed = False
+
+        def forward(self, value):
+            return self.middle(self.first(value))[0]
+
+    harness = hytorch.harness.register(DirectionHarness("frozen"))
+    model = FrozenMiddle().to(harness)
+    optimizer = hytorch.optim.DFM(model.parameters())
+    output = model(hytorch.space(new_repo.root, harness=harness))
+
+    hytorch.Loss(output, "Improve the learned input.").backward()
+
+    assert model.middle.weight[0].feed is None
+    assert model.first.weight[0].feed is not None
+    optimizer.step()
+    assert len(harness.owner_reductions) == 1
 
 
 def test_backward_runs_ready_distinct_workspaces_in_parallel(new_repo):
@@ -184,7 +300,7 @@ def test_backward_runs_ready_distinct_workspaces_in_parallel(new_repo):
     optimizer.step()
 
     for view in model.split.weight:
-        assert any(name.startswith("update-session-") for name in os.listdir(view.path))
+        assert os.path.isfile(os.path.join(view.path, "owner-update.md"))
 
 
 def test_zero_feed_discards_unpromoted_candidate(new_repo):
@@ -205,8 +321,14 @@ def test_zero_feed_discards_unpromoted_candidate(new_repo):
 def test_backward_allows_an_unchanged_workspace(new_repo):
     class NoMutation(DirectionHarness):
         def resume(self, session, directory, prompt, mtype, **kwargs):
-            return json.dumps(
-                {"feedback": ["Preserve more useful detail in the input."]}
+            return hytorch.harness.Result(
+                json.dumps(
+                    {
+                        "update": "Keep the useful behavior.",
+                        "feedback": ["Preserve more useful detail in the input."],
+                    }
+                ),
+                session,
             )
 
     harness = hytorch.harness.register(NoMutation("no-mutation"))
@@ -218,7 +340,8 @@ def test_backward_allows_an_unchanged_workspace(new_repo):
     hytorch.Loss(output, "Keep the current behavior.").backward()
     optimizer.step()
 
-    assert model.layer.weight[0].revision == before
+    assert model.layer.weight[0].revision != before
+    assert os.path.isfile(os.path.join(model.layer.weight[0].path, "owner-update.md"))
     assert output.feed_fn.released
 
 
@@ -259,8 +382,10 @@ def test_backward_requires_one_feedback_string_per_input(new_repo):
             selected = find_agent_workspace(workspace)
             with open(os.path.join(selected, "changed.md"), "w") as file:
                 file.write("changed\n")
-            commit_agent_changes(workspace, "agent: incomplete response")
-            return json.dumps({"feedback": []})
+            return hytorch.harness.Result(
+                json.dumps({"update": "Use exact evidence.", "feedback": []}),
+                session,
+            )
 
     harness = hytorch.harness.register(MissingFeedback("missing-feedback"))
     model = OneNode().to(harness)
@@ -269,3 +394,39 @@ def test_backward_requires_one_feedback_string_per_input(new_repo):
 
     with pytest.raises(RuntimeError, match="requires 1 feedback strings"):
         hytorch.Loss(output, "Explain the required input change.").backward()
+
+
+def test_backward_accepts_a_rotated_native_session_tip(new_repo):
+    class CompactingHarness(DirectionHarness):
+        def resume(self, session, directory, prompt, mtype, **kwargs):
+            result = super().resume(session, directory, prompt, mtype, **kwargs)
+            rotated = hytorch.harness.Session(
+                session.harness, session.id + "-compacted", session.storage
+            )
+            return hytorch.harness.Result(result.text, rotated)
+
+    harness = hytorch.harness.register(CompactingHarness("compacting"))
+    model = OneNode().to(harness)
+    optimizer = hytorch.optim.DFM(model.parameters())
+    output = model(hytorch.space(new_repo.root, harness=harness))
+
+    hytorch.Loss(output, "Retain the useful context.").backward()
+
+    assert harness.closed[-1].id.endswith("-compacted")
+    optimizer.step()
+
+
+def test_backward_rejects_git_metadata_in_native_agent_state(new_repo):
+    class NestedGitHarness(DirectionHarness):
+        def resume(self, session, directory, prompt, mtype, **kwargs):
+            result = super().resume(session, directory, prompt, mtype, **kwargs)
+            os.makedirs(os.path.join(directory, "workspace", ".git"))
+            return result
+
+    harness = hytorch.harness.register(NestedGitHarness("nested-git"))
+    model = OneNode().to(harness)
+    hytorch.optim.DFM(model.parameters())
+    output = model(hytorch.space(new_repo.root, harness=harness))
+
+    with pytest.raises(ValueError, match="must not contain Git metadata"):
+        hytorch.Loss(output, "Keep state portable.").backward()

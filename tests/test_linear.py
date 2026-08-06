@@ -35,7 +35,7 @@ class RecordingHarness(hytorch.harness.Harness):
         return hytorch.harness.Result("done", session)
 
     def resume(self, session, directory, prompt, mtype, **kwargs):
-        return "done"
+        return hytorch.harness.Result("done", session)
 
     def close(self, session):
         pass
@@ -120,8 +120,9 @@ def test_dense_linear_runs_one_agent_per_output_without_state_injection(new_repo
     assert all(expected not in prompt for prompt in harness.prompts)
     assert all(os.path.isdir(output.feed_fn.workspace) for output in outputs)
     assert all(os.path.basename(output.dir) == "statespace" for output in outputs)
-    assert harness.layouts == [["statespace", "workspace"]] * 3
+    assert harness.layouts == [["parameter", "statespace", "workspace"]] * 3
     for output in outputs:
+        assert os.path.isdir(output.feed_fn.parameter)
         assert os.path.isdir(os.path.join(output.dir, ".git"))
         assert not os.path.exists(os.path.join(output.feed_fn.root, "inputs"))
         assert (
@@ -144,23 +145,26 @@ def test_dense_linear_runs_one_agent_per_output_without_state_injection(new_repo
         assert "Decide carefully." in model.layer.weight[index].text()
 
 
-def test_forward_rejects_workspace_mutation(new_repo):
-    class InvalidHarness(RecordingHarness):
+def test_forward_keeps_workspace_mutation_private(new_repo):
+    class MemoryHarness(RecordingHarness):
         def start(self, directory, prompt, mtype, **kwargs):
+            result = super().start(directory, prompt, mtype, **kwargs)
             path = os.path.join(
                 find_agent_workspace(os.path.join(directory, "workspace")),
-                "AGENTS.md",
+                "forward-memory.md",
             )
-            os.chmod(path, 0o644)
             with open(path, "w") as file:
-                file.write("illegal\n")
-            session = hytorch.harness.Session(self.name, "invalid", "")
-            return hytorch.harness.Result("done", session)
+                file.write("candidate only\n")
+            return result
 
-    harness = hytorch.harness.register(InvalidHarness("invalid-forward"))
+    harness = hytorch.harness.register(MemoryHarness("forward-memory"))
     model = Model(1, 1).to(harness)
-    with pytest.raises(RuntimeError, match="forward modified read-only workspace"):
-        model(hytorch.space(new_repo.root, harness=harness))
+    output = model(hytorch.space(new_repo.root, harness=harness))[0]
+
+    assert os.path.isfile(os.path.join(output.feed_fn.workspace, "forward-memory.md"))
+    assert not os.path.exists(
+        os.path.join(model.layer.weight[0].path, "forward-memory.md")
+    )
 
 
 def test_forward_requires_committed_agent_changes(new_repo):

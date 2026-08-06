@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
+import tempfile
 import uuid
 from collections.abc import Iterator
 
@@ -200,45 +202,64 @@ def copy_tree(source: str, destination: str) -> None:
     shutil.copytree(source, destination, symlinks=True)
 
 
-def create_workspace_checkout(
-    source: str,
+def materialize_agent_state(
+    store: ParameterStore,
     revision: str,
     relative_path: str,
     destination: str,
-) -> Repo:
-    """Create a sparse model checkout with full global workspace history."""
+) -> None:
+    """Export one agent state without exposing the private model repository."""
     if os.path.lexists(destination):
         set_tree_writable(destination, True)
         shutil.rmtree(destination)
-    result = subprocess.run(
-        [
-            "git",
-            "clone",
-            "--quiet",
-            "--no-local",
-            "--no-checkout",
-            source,
-            destination,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "clone workspace store failed")
-    _git(destination, "config", "user.name", "HyTorch")
-    _git(destination, "config", "user.email", "hytorch@localhost")
-    _git(destination, "sparse-checkout", "init", "--no-cone")
-    _git(
-        destination,
-        "sparse-checkout",
-        "set",
-        "--no-cone",
-        f"/{relative_path}/",
-    )
-    _git(destination, "switch", "-c", "hytorch-workspace", revision)
-    _git(destination, "remote", "remove", "origin")
-    return Repo.discover(destination)
+    with tempfile.TemporaryDirectory(prefix="hytorch-agent-export-") as snapshot:
+        store.repo.export_tree(revision, snapshot)
+        source = os.path.join(snapshot, relative_path)
+        if os.path.isdir(source):
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            os.makedirs(destination)
+
+
+def validate_agent_state(
+    root: str,
+    *,
+    max_files: int = 100_000,
+    max_bytes: int = 2 * 1024 * 1024 * 1024,
+) -> None:
+    """Validate that private Git can store a complete plain agent state."""
+    root = os.path.realpath(root)
+    file_count = 0
+    total_bytes = 0
+    for current, directories, files in os.walk(root, followlinks=False):
+        if ".git" in directories or ".git" in files:
+            raise ValueError(
+                "hytorch: native agent state must not contain Git metadata"
+            )
+        for name in directories + files:
+            path = os.path.join(current, name)
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode):
+                target = os.path.realpath(path)
+                if os.path.commonpath((root, target)) != root:
+                    raise ValueError(
+                        "hytorch: native agent state contains an escaping symlink"
+                    )
+            elif not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                raise ValueError(
+                    "hytorch: native agent state contains an unsupported special file"
+                )
+            elif stat.S_ISREG(mode):
+                file_count += 1
+                total_bytes += os.lstat(path).st_size
+                if file_count > max_files:
+                    raise ValueError(
+                        f"hytorch: native agent state exceeds {max_files} files"
+                    )
+                if total_bytes > max_bytes:
+                    raise ValueError(
+                        f"hytorch: native agent state exceeds {max_bytes} bytes"
+                    )
 
 
 def set_tree_writable(root: str, writable: bool) -> None:
@@ -259,12 +280,14 @@ def set_tree_writable(root: str, writable: bool) -> None:
             os.chmod(path, (mode | file_write) if writable else (mode & ~0o222))
 
 
-def tree_manifest(root: str) -> dict[str, bytes]:
+def tree_manifest(root: str, *, include_git: bool = False) -> dict[str, bytes]:
     """Return a stable file manifest for mutation-boundary checks."""
     result: dict[str, bytes] = {}
     for current, directories, files in os.walk(root):
-        directories[:] = sorted(name for name in directories if name != ".git")
-        for name in sorted(value for value in files if value != ".git"):
+        directories[:] = sorted(
+            name for name in directories if include_git or name != ".git"
+        )
+        for name in sorted(value for value in files if include_git or value != ".git"):
             path = os.path.join(current, name)
             relative = os.path.relpath(path, root)
             if os.path.islink(path):
@@ -339,6 +362,8 @@ __all__ = [
     "Parameter",
     "ParameterView",
     "copy_tree",
+    "materialize_agent_state",
     "set_tree_writable",
     "tree_manifest",
+    "validate_agent_state",
 ]

@@ -4,7 +4,18 @@ import subprocess
 
 import pytest
 
-from hytorch._environment import agent_environment, docker_environment_file
+from hytorch._environment import (
+    KNOWN_PROVIDER_KEYS,
+    agent_environment,
+    command_environment,
+    docker_environment_file,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_provider_environment(monkeypatch):
+    for name in KNOWN_PROVIDER_KEYS:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _project(tmp_path):
@@ -62,6 +73,21 @@ def test_docker_environment_file_is_private_and_temporary(tmp_path, monkeypatch)
         contents = open(path, encoding="utf-8").read()
         assert contents == ("COMMENTED=value\nPLAIN=value\nQUOTED=value with spaces\n")
     assert not os.path.exists(path)
+
+
+def test_command_environment_does_not_leak_undeclared_shell_values(
+    tmp_path, monkeypatch
+):
+    root = _project(tmp_path)
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("UNRELATED_SECRET", "do-not-forward")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-key")
+
+    values = command_environment(values={"HARNESS_SETTING": "enabled"})
+
+    assert values["OPENAI_API_KEY"] == "provider-key"
+    assert values["HARNESS_SETTING"] == "enabled"
+    assert "UNRELATED_SECRET" not in values
 
 
 def test_missing_explicit_environment_file_fails(tmp_path, monkeypatch):

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 from collections.abc import Iterable
 
 from ..harness import registered
-from ..parameter import Parameter
+from ..parameter import Parameter, set_tree_writable
 
 
 class Optimizer:
@@ -34,7 +36,7 @@ class Optimizer:
         for parameter in self.params:
             parameter.zero_feed()
 
-    def _backward(self, output, feedback: str) -> None:
+    def _backward(self, output, feedback: str, *, retain_graph: bool = False) -> None:
         raise NotImplementedError
 
     def _discard_pending(self) -> None:
@@ -50,8 +52,14 @@ def _release(context) -> None:
         raise RuntimeError(
             f"hytorch.optim: harness {context.harness!r} is not registered"
         ) from exc
-    harness.close(context.session)
-    context.released = True
+    try:
+        harness.close(context.session)
+    finally:
+        for path in (context.workspace, context.parameter):
+            if os.path.isdir(path):
+                set_tree_writable(path, True)
+                shutil.rmtree(path, ignore_errors=True)
+        context.released = True
 
 
 __all__ = ["Optimizer"]
