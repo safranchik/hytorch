@@ -10,8 +10,19 @@ import hytorch
 
 
 def run_git(root: str, *args: str) -> str:
+    env = dict(os.environ)
+    env.update(
+        GIT_AUTHOR_NAME="HyTorch Test",
+        GIT_AUTHOR_EMAIL="hytorch-test@localhost",
+        GIT_COMMITTER_NAME="HyTorch Test",
+        GIT_COMMITTER_EMAIL="hytorch-test@localhost",
+    )
     result = subprocess.run(
-        ["git", "-C", root, *args], capture_output=True, text=True, check=False
+        ["git", "-C", root, *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if result.returncode != 0:
         raise RuntimeError(f"git {args}: {result.stderr}")
